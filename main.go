@@ -25,7 +25,7 @@ var fieldNames = map[string]string{
 
 // API 返回结构
 type apiResponse struct {
-	Success bool `json:"success"`
+	Success bool   `json:"success"`
 	Code    string `json:"code"`
 	Message string `json:"message"`
 	Data    struct {
@@ -75,7 +75,12 @@ func setupLogger() {
 // fetchStats 请求接口并解析需要的字段
 func fetchStats() (*record, error) {
 	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Get(apiURL)
+	req, err := http.NewRequest("GET", apiURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("构建请求失败: %w", err)
+	}
+	req.Header.Set("User-Agent", "Apifox/1.0.0 (https://apifox.com)")
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("请求失败: %w", err)
 	}
