@@ -45,6 +45,7 @@ var (
 	historyFile string
 	logFile     string
 	reportsDir  string
+	logsDir     string
 )
 
 func init() {
@@ -52,7 +53,23 @@ func init() {
 	historyFile = filepath.Join(dir, "stats_history.json")
 	logFile = filepath.Join(dir, "stats_log.csv")
 	reportsDir = filepath.Join(dir, "reports")
+	logsDir = filepath.Join(dir, "logs")
 	_ = os.MkdirAll(reportsDir, 0755)
+	_ = os.MkdirAll(logsDir, 0755)
+	setupLogger()
+}
+
+// setupLogger 将日志同时输出到 stdout 和 ./logs/glean_YYYY-MM-DD.log
+func setupLogger() {
+	today := time.Now().Format("2006-01-02")
+	logPath := filepath.Join(logsDir, "glean_"+today+".log")
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.SetOutput(os.Stdout)
+		log.Printf("警告: 无法打开日志文件 %s: %v，仅输出到控制台", logPath, err)
+		return
+	}
+	log.SetOutput(io.MultiWriter(os.Stdout, f))
 }
 
 // fetchStats 请求接口并解析需要的字段
@@ -178,6 +195,7 @@ func collectOnce() {
 	if prev != nil {
 		prevDay := prev.Timestamp[:10]
 		if prevDay != curDay {
+			setupLogger() // 切换到新一天的日志文件
 			if err := generateDailyReport(hist, prevDay); err != nil {
 				log.Printf("生成日报告失败 [%s]: %v", prevDay, err)
 			} else {

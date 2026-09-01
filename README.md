@@ -21,6 +21,7 @@ stats.exe --once     # 仅采集一次后退出（适合配合系统计划任务
 - 手动补生成：`stats.exe -report=2026-09-01`（基于本地 `stats_history.json` 历史数据）。
 
 ## 数据文件
+- `logs/glean_YYYY-MM-DD.log` : 运行日志（按天切分，同时输出到控制台）
 - `stats_history.json` : 每次采集的原始累计值列表
 - `stats_log.csv`      : 增量统计（UTF-8 BOM，Excel 可直接打开）
   - 累计寻源次数 / 当小时寻源增量
