@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"crypto/tls"
 	"encoding/csv"
 	"encoding/json"
 	"flag"
@@ -74,7 +75,12 @@ func setupLogger() {
 
 // fetchStats 请求接口并解析需要的字段
 func fetchStats() (*record, error) {
-	client := &http.Client{Timeout: 15 * time.Second}
+	client := &http.Client{
+		Timeout: 15 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // 跳过 TLS 证书校验
+		},
+	}
 	req, err := http.NewRequest("GET", apiURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("构建请求失败: %w", err)
