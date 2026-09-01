@@ -43,20 +43,60 @@ type record struct {
 }
 
 var (
-	historyFile string
-	logFile     string
-	reportsDir  string
-	logsDir     string
+	historyFile  string
+	logFile      string
+	reportsDir   string
+	logsDir      string
+	debugEnabled bool
+	collectCount int // 本次进程内已完成的采集次数
 )
 
+// initDebug 在 flag.Parse 之前扫描命令行，使 init 阶段的日志也能受 -debug 控制
+func initDebug() {
+	for _, a := range os.Args[1:] {
+		if a == "-debug" || a == "--debug" || a == "-debug=true" || a == "--debug=true" {
+			debugEnabled = true
+			return
+		}
+	}
+}
+
+// debugf 输出调试日志（前缀 [DEBUG] + 毫秒时间），仅在 -debug 开启时打印
+func debugf(format string, args ...any) {
+	if !debugEnabled {
+		return
+	}
+	log.Printf("[DEBUG] ["+time.Now().Format("15:04:05.000")+"] "+format, args...)
+}
+
+// truncate 截断长字符串，避免调试日志被超长响应体撑爆
+func truncate(s string, max int) string {
+	if max <= 0 || len(s) <= max {
+		return s
+	}
+	return s[:max] + fmt.Sprintf("...(已截断, 共%d字节)", len(s))
+}
+
 func init() {
-	dir, _ := os.Getwd()
+	initDebug()
+	log.SetOutput(os.Stdout) // 避免 setupLogger 之前的日志落到 stderr
+	dir, err := os.Getwd()
+	if err != nil {
+		debugf("获取当前工作目录失败: %v", err)
+		dir = "."
+	}
 	historyFile = filepath.Join(dir, "stats_history.json")
 	logFile = filepath.Join(dir, "stats_log.csv")
 	reportsDir = filepath.Join(dir, "reports")
 	logsDir = filepath.Join(dir, "logs")
-	_ = os.MkdirAll(reportsDir, 0755)
-	_ = os.MkdirAll(logsDir, 0755)
+	debugf("工作目录: %s", dir)
+	if err := os.MkdirAll(reportsDir, 0755); err != nil {
+		log.Printf("警告: 无法创建报告目录 %s: %v", reportsDir, err)
+	}
+	if err := os.MkdirAll(logsDir, 0755); err != nil {
+		log.Printf("警告: 无法创建日志目录 %s: %v", logsDir, err)
+	}
+	debugf("路径配置: 历史=%s | CSV=%s | 报告目录=%s | 日志目录=%s", historyFile, logFile, reportsDir, logsDir)
 	setupLogger()
 }
 
@@ -71,10 +111,12 @@ func setupLogger() {
 		return
 	}
 	log.SetOutput(io.MultiWriter(os.Stdout, f))
+	debugf("日志文件已就绪: %s", logPath)
 }
 
 // fetchStats 请求接口并解析需要的字段
 func fetchStats() (*record, error) {
+	debugf("准备请求接口: GET %s (超时=15s, 跳过TLS校验=true)", apiURL)
 	client := &http.Client{
 		Timeout: 15 * time.Second,
 		Transport: &http.Transport{
@@ -83,44 +125,75 @@ func fetchStats() (*record, error) {
 	}
 	req, err := http.NewRequest("GET", apiURL, nil)
 	if err != nil {
+		debugf("构建请求失败: %v", err)
 		return nil, fmt.Errorf("构建请求失败: %w", err)
 	}
 	req.Header.Set("User-Agent", "Apifox/1.0.0 (https://apifox.com)")
+	debugf("请求头: User-Agent=%q, Host=%q", req.Header.Get("User-Agent"), req.URL.Host)
+
+	start := time.Now()
 	resp, err := client.Do(req)
+	elapsed := time.Since(start)
 	if err != nil {
+		debugf("请求失败 (耗时 %v): %v", elapsed, err)
 		return nil, fmt.Errorf("请求失败: %w", err)
 	}
 	defer resp.Body.Close()
+	debugf("HTTP 响应: 状态码=%d 状态=%q 耗时=%v", resp.StatusCode, resp.Status, elapsed)
+	debugf("响应头: Content-Type=%q Content-Length=%d",
+		resp.Header.Get("Content-Type"), resp.ContentLength)
+	if resp.StatusCode != http.StatusOK {
+		debugf("警告: 状态码非 200 (%d)，仍尝试解析响应体", resp.StatusCode)
+	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
+		debugf("读取响应体失败: %v", err)
 		return nil, fmt.Errorf("读取响应失败: %w", err)
 	}
+	debugf("响应体: %d 字节, 内容=%s", len(body), truncate(strings.TrimSpace(string(body)), 1000))
 
 	var ar apiResponse
 	if err := json.Unmarshal(body, &ar); err != nil {
+		debugf("JSON 解析失败: %v", err)
 		return nil, fmt.Errorf("解析 JSON 失败: %w", err)
 	}
+	debugf("解析结果: success=%v code=%q message=%q searchCount=%d contactCount=%d",
+		ar.Success, ar.Code, ar.Message, ar.Data.SearchCount, ar.Data.ContactCount)
 	if !ar.Success {
+		debugf("接口返回失败标记: message=%q code=%q", ar.Message, ar.Code)
 		return nil, fmt.Errorf("接口返回失败: %s", ar.Message)
 	}
 
-	return &record{
+	rec := &record{
 		Timestamp: time.Now().Format("2006-01-02 15:04:05"),
 		Search:    ar.Data.SearchCount,
 		Contact:   ar.Data.ContactCount,
-	}, nil
+	}
+	debugf("构造记录: 时间=%s 累计寻源=%d 累计触达=%d", rec.Timestamp, rec.Search, rec.Contact)
+	return rec, nil
 }
 
 // loadHistory 读取历史记录
 func loadHistory() []record {
+	debugf("读取历史文件: %s", historyFile)
 	data, err := os.ReadFile(historyFile)
 	if err != nil {
+		debugf("历史文件不可用，按空历史处理: %v", err)
 		return nil
 	}
+	debugf("历史文件读取成功: %d 字节", len(data))
 	var hist []record
 	if err := json.Unmarshal(data, &hist); err != nil {
+		debugf("历史文件 JSON 解析失败，按空历史处理: %v", err)
 		return nil
+	}
+	debugf("历史记录条数: %d", len(hist))
+	if len(hist) > 0 {
+		debugf("历史区间: %s ~ %s | 首条(寻源=%d, 触达=%d) | 末条(寻源=%d, 触达=%d)",
+			hist[0].Timestamp, hist[len(hist)-1].Timestamp,
+			hist[0].Search, hist[0].Contact,
+			hist[len(hist)-1].Search, hist[len(hist)-1].Contact)
 	}
 	return hist
 }
@@ -129,9 +202,16 @@ func loadHistory() []record {
 func saveHistory(hist []record) error {
 	data, err := json.MarshalIndent(hist, "", "  ")
 	if err != nil {
+		debugf("历史记录序列化失败: %v", err)
 		return err
 	}
-	return os.WriteFile(historyFile, data, 0644)
+	debugf("写入历史文件: %s, 共 %d 条, %d 字节", historyFile, len(hist), len(data))
+	if err := os.WriteFile(historyFile, data, 0644); err != nil {
+		debugf("历史文件写入失败: %v", err)
+		return err
+	}
+	debugf("历史文件写入成功")
+	return nil
 }
 
 // appendLog 将本次采集及与上一小时的增量写入 CSV
@@ -140,9 +220,11 @@ func appendLog(cur record, prev *record) error {
 	if _, err := os.Stat(logFile); os.IsNotExist(err) {
 		needHeader = true
 	}
+	debugf("写入 CSV: %s (写表头=%v)", logFile, needHeader)
 
 	f, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
+		debugf("打开 CSV 失败: %v", err)
 		return err
 	}
 	defer f.Close()
@@ -156,39 +238,62 @@ func appendLog(cur record, prev *record) error {
 			"累计寻源次数", "当小时寻源增量",
 			"累计触达次数", "当小时触达增量",
 		}); err != nil {
+			debugf("写入 CSV 表头失败: %v", err)
 			return err
 		}
+		debugf("已写入 CSV 表头")
 	}
 
 	var searchDelta, contactDelta string
 	if prev != nil {
 		searchDelta = fmt.Sprintf("%d", cur.Search-prev.Search)
 		contactDelta = fmt.Sprintf("%d", cur.Contact-prev.Contact)
+	} else {
+		debugf("无上一条记录，增量列留空")
 	}
 
-	return w.Write([]string{
+	row := []string{
 		cur.Timestamp,
 		fmt.Sprintf("%d", cur.Search), searchDelta,
 		fmt.Sprintf("%d", cur.Contact), contactDelta,
-	})
+	}
+	debugf("CSV 行内容: %v", row)
+	if err := w.Write(row); err != nil {
+		debugf("写入 CSV 行失败: %v", err)
+		return err
+	}
+	w.Flush()
+	if err := w.Error(); err != nil {
+		debugf("CSV 缓冲区刷新失败: %v", err)
+		return err
+	}
+	debugf("CSV 写入完成")
+	return nil
 }
 
 // collectOnce 执行一次采集
 func collectOnce() {
+	start := time.Now()
+	log.Printf("===== 开始第 %d 次采集 =====", collectCount+1)
 	hist := loadHistory()
 	var prev *record
 	if len(hist) > 0 {
 		p := hist[len(hist)-1]
 		prev = &p
+		debugf("上一条记录: 时间=%s 寻源=%d 触达=%d", p.Timestamp, p.Search, p.Contact)
+	} else {
+		debugf("无历史记录，本次为首次采集")
 	}
 
 	cur, err := fetchStats()
 	if err != nil {
 		log.Printf("采集失败: %v", err)
+		debugf("本次采集失败，跳过后续处理 (耗时 %v)", time.Since(start))
 		return
 	}
 
 	hist = append(hist, *cur)
+	debugf("历史记录数: %d -> %d", len(hist)-1, len(hist))
 	if err := saveHistory(hist); err != nil {
 		log.Printf("保存历史失败: %v", err)
 	}
@@ -198,89 +303,292 @@ func collectOnce() {
 
 	log.Printf("采集成功 [%s] 累计寻源=%d 累计触达=%d", cur.Timestamp, cur.Search, cur.Contact)
 	if prev != nil {
-		log.Printf("  较上一小时增量: 寻源 +%d, 触达 +%d", cur.Search-prev.Search, cur.Contact-prev.Contact)
+		sd := cur.Search - prev.Search
+		cd := cur.Contact - prev.Contact
+		log.Printf("  较上一小时增量: 寻源 %+d, 触达 %+d", sd, cd)
+		if sd < 0 || cd < 0 {
+			debugf("警告: 检测到负增量 (寻源=%d, 触达=%d)，可能是接口数据被重置", sd, cd)
+		}
 	}
+	collectCount++
 
-	// 跨天检测：若当天日期与上一条记录不同，则为"上一天"生成日报告
+	// 跨天检测：若当天日期与上一条记录不同，则为"上一天"生成日报，并检测周/月/年报告
 	curDay := cur.Timestamp[:10]
 	if prev != nil {
 		prevDay := prev.Timestamp[:10]
+		debugf("跨天检测: 当前=%s 上一条=%s", curDay, prevDay)
 		if prevDay != curDay {
+			log.Printf("检测到跨天: %s -> %s，开始生成 %s 的报告", prevDay, curDay, prevDay)
 			setupLogger() // 切换到新一天的日志文件
 			if err := generateDailyReport(hist, prevDay); err != nil {
-				log.Printf("生成日报告失败 [%s]: %v", prevDay, err)
+				log.Printf("生成日报失败 [%s]: %v", prevDay, err)
 			} else {
-				log.Printf("已生成日报告: %s", prevDay)
+				log.Printf("已生成日报: %s", prevDay)
 			}
+			autoGeneratePeriodicReports(hist, prevDay)
+		} else {
+			debugf("未跨天，跳过报告生成")
 		}
+	} else {
+		debugf("首次采集，无上一天可比，跳过报告生成")
 	}
+	debugf("本次采集总耗时: %v", time.Since(start))
 }
 
-// generateDailyReport 基于历史中为 targetDay(YYYY-MM-DD) 的记录生成日报告
-func generateDailyReport(hist []record, targetDay string) error {
-	dayRecs := make([]record, 0)
-	for _, r := range hist {
-		if len(r.Timestamp) >= 10 && r.Timestamp[:10] == targetDay {
-			dayRecs = append(dayRecs, r)
+// barChart 生成条形图：value 相对 max 按比例填充 █，其余用 ░
+func barChart(value, max int64, width int) string {
+	filled := 0
+	if max > 0 {
+		filled = int(float64(value) / float64(max) * float64(width))
+		if value > 0 && filled == 0 {
+			filled = 1
 		}
 	}
-	if len(dayRecs) == 0 {
-		return fmt.Errorf("无 %s 的数据", targetDay)
+	if filled > width {
+		filled = width
 	}
+	return strings.Repeat("█", filled) + strings.Repeat("░", width-filled)
+}
 
-	first := dayRecs[0]
-	last := dayRecs[len(dayRecs)-1]
-
-	// 按小时聚合增量
-	var totalSearchDelta, totalContactDelta int64
-	var activeHours int
-	var peakSearchHour, peakContactHour string
-	var peakSearchVal, peakContactVal int64 = -1, -1
-
-	for i := 1; i < len(dayRecs); i++ {
-		sd := dayRecs[i].Search - dayRecs[i-1].Search
-		cd := dayRecs[i].Contact - dayRecs[i-1].Contact
-		totalSearchDelta += sd
-		totalContactDelta += cd
-		if sd > 0 || cd > 0 {
-			activeHours++
+// aggByPeriod 按周期聚合增量：match 决定记录是否计入，keyFunc 决定桶（小时/日期/月份）
+func aggByPeriod(hist []record, match func(record) bool, keyFunc func(record) string) map[string][2]int64 {
+	out := make(map[string][2]int64)
+	matched, clamped := 0, 0
+	debugf("开始按周期聚合: 总记录=%d 条", len(hist))
+	for i := 1; i < len(hist); i++ {
+		r := hist[i]
+		if !match(r) {
+			continue
 		}
-		hr := dayRecs[i].Timestamp[11:13]
-		if sd > peakSearchVal {
-			peakSearchVal = sd
-			peakSearchHour = hr
+		matched++
+		s := r.Search - hist[i-1].Search
+		c := r.Contact - hist[i-1].Contact
+		if s < 0 {
+			s = 0
+			clamped++
 		}
-		if cd > peakContactVal {
-			peakContactVal = cd
-			peakContactHour = hr
+		if c < 0 {
+			c = 0
+			clamped++
+		}
+		k := keyFunc(r)
+		v := out[k]
+		v[0] += s
+		v[1] += c
+		out[k] = v
+	}
+	debugf("聚合完成: 命中=%d 条, 负增量钳制=%d 次, 桶数=%d", matched, clamped, len(out))
+	return out
+}
+
+// renderBarSection 渲染一个指标的条形图区块（idx=0 寻源, idx=1 触达）
+func renderBarSection(w *bufio.Writer, title string, deltas map[string][2]int64, keys, labels []string, idx int) {
+	fmt.Fprintf(w, "【%s】(次)\n", title)
+	max := int64(0)
+	hasAny := false
+	for _, k := range keys {
+		v := deltas[k][idx]
+		if v > 0 {
+			hasAny = true
+		}
+		if v > max {
+			max = v
 		}
 	}
+	if !hasAny {
+		fmt.Fprintf(w, "  该时段无增量\n\n")
+		return
+	}
+	for i, k := range keys {
+		v := deltas[k][idx]
+		flag := ""
+		if v > 0 && v == max {
+			flag = " ⚠️"
+		}
+		fmt.Fprintf(w, "  %s %s %10d%s\n", labels[i], barChart(v, max, 20), v, flag)
+	}
+	fmt.Fprintf(w, "\n")
+}
 
+// renderReport 渲染通用报告并写入 ./reports
+func renderReport(title, fileName string, deltas map[string][2]int64, keys, labels []string) error {
 	var b strings.Builder
 	w := bufio.NewWriter(&b)
 	fmt.Fprintf(w, "==================================================\n")
-	fmt.Fprintf(w, "       Insigmind 每日活跃度报告  %s\n", targetDay)
+	fmt.Fprintf(w, "  Insigmind %s\n", title)
 	fmt.Fprintf(w, "==================================================\n\n")
-	fmt.Fprintf(w, "采集点数: %d 次\n", len(dayRecs))
-	fmt.Fprintf(w, "活跃小时数(有增量): %d 小时\n\n", activeHours)
 
-	fmt.Fprintf(w, "【累计寻源次数】\n")
-	fmt.Fprintf(w, "  日初累计: %d\n", first.Search)
-	fmt.Fprintf(w, "  日末累计: %d\n", last.Search)
-	fmt.Fprintf(w, "  当日新增: %+d\n", totalSearchDelta)
-	fmt.Fprintf(w, "  峰值小时: %s 时 (+%d)\n\n", peakSearchHour, peakSearchVal)
+	active := 0
+	for _, k := range keys {
+		if deltas[k][0] > 0 || deltas[k][1] > 0 {
+			active++
+		}
+	}
+	fmt.Fprintf(w, "覆盖周期数(有增量): %d / %d\n\n", active, len(keys))
+	debugf("渲染报告: 标题=%q 周期数=%d 有增量周期=%d", title, len(keys), active)
 
-	fmt.Fprintf(w, "【累计触达次数】\n")
-	fmt.Fprintf(w, "  日初累计: %d\n", first.Contact)
-	fmt.Fprintf(w, "  日末累计: %d\n", last.Contact)
-	fmt.Fprintf(w, "  当日新增: %+d\n", totalContactDelta)
-	fmt.Fprintf(w, "  峰值小时: %s 时 (+%d)\n\n", peakContactHour, peakContactVal)
-
-	fmt.Fprintf(w, "生成时间: %s\n", time.Now().Format("2006-01-02 15:04:05"))
+	renderBarSection(w, "累计寻源次数", deltas, keys, labels, 0)
+	renderBarSection(w, "累计触达次数", deltas, keys, labels, 1)
 	w.Flush()
 
-	reportPath := filepath.Join(reportsDir, targetDay+"_report.txt")
-	return os.WriteFile(reportPath, []byte(b.String()), 0644)
+	content := []byte(b.String())
+	outPath := filepath.Join(reportsDir, fileName)
+	debugf("写入报告文件: %s (%d 字节)", outPath, len(content))
+	if err := os.WriteFile(outPath, content, 0644); err != nil {
+		debugf("报告文件写入失败: %s: %v", outPath, err)
+		return err
+	}
+	debugf("报告文件写入成功: %s", outPath)
+	return nil
+}
+
+// generateDailyReport 生成某天的日报（按小时）
+func generateDailyReport(hist []record, targetDay string) error {
+	day, err := time.Parse("2006-01-02", targetDay)
+	if err != nil {
+		return err
+	}
+	dayStr := day.Format("2006-01-02")
+	debugf("生成日报: 目标日期=%s (星期%s)", dayStr, day.Weekday())
+	hasData := false
+	dayCount := 0
+	for _, r := range hist {
+		if len(r.Timestamp) >= 10 && r.Timestamp[:10] == dayStr {
+			hasData = true
+			dayCount++
+		}
+	}
+	if !hasData {
+		debugf("无 %s 的数据，跳过日报生成", targetDay)
+		return fmt.Errorf("无 %s 的数据", targetDay)
+	}
+	debugf("%s 命中记录: %d 条", dayStr, dayCount)
+
+	deltas := aggByPeriod(hist, func(r record) bool {
+		return len(r.Timestamp) >= 10 && r.Timestamp[:10] == dayStr
+	}, func(r record) string { return r.Timestamp[11:13] })
+
+	keys := make([]string, 24)
+	labels := make([]string, 24)
+	for h := 0; h < 24; h++ {
+		keys[h] = fmt.Sprintf("%02d", h)
+		labels[h] = fmt.Sprintf("%s %02d:00", day.Format("01-02"), h)
+	}
+	return renderReport(fmt.Sprintf("日活跃度报告  %s", dayStr), targetDay+"_report.txt", deltas, keys, labels)
+}
+
+// generateWeeklyReport 生成 ref 所在周的周报（周一~周日，按天）
+func generateWeeklyReport(hist []record, ref time.Time) error {
+	monday := ref.AddDate(0, 0, -int((int(ref.Weekday())+6)%7))
+	sunday := monday.AddDate(0, 0, 6)
+	startStr := monday.Format("2006-01-02")
+	endStr := sunday.Format("2006-01-02")
+	debugf("生成周报: 参考日=%s -> 周期 %s ~ %s", ref.Format("2006-01-02"), startStr, endStr)
+
+	deltas := aggByPeriod(hist, func(r record) bool {
+		return len(r.Timestamp) >= 10 && r.Timestamp[:10] >= startStr && r.Timestamp[:10] <= endStr
+	}, func(r record) string { return r.Timestamp[:10] })
+
+	weekdayNames := []string{"周一", "周二", "周三", "周四", "周五", "周六", "周日"}
+	keys := make([]string, 7)
+	labels := make([]string, 7)
+	for i := 0; i < 7; i++ {
+		d := monday.AddDate(0, 0, i)
+		keys[i] = d.Format("2006-01-02")
+		labels[i] = d.Format("01-02") + " " + weekdayNames[i]
+	}
+	return renderReport(
+		fmt.Sprintf("周活跃度报告  %s ~ %s", startStr, endStr),
+		fmt.Sprintf("week_%s_report.txt", startStr),
+		deltas, keys, labels,
+	)
+}
+
+// generateMonthlyReport 生成 ref 所在月份的月报（按天）
+func generateMonthlyReport(hist []record, ref time.Time) error {
+	ym := ref.Format("2006-01")
+	debugf("生成月报: 目标月份=%s (参考日=%s)", ym, ref.Format("2006-01-02"))
+	deltas := aggByPeriod(hist, func(r record) bool {
+		return len(r.Timestamp) >= 7 && r.Timestamp[:7] == ym
+	}, func(r record) string { return r.Timestamp[:10] })
+
+	days := time.Date(ref.Year(), ref.Month()+1, 0, 0, 0, 0, 0, ref.Location()).Day()
+	keys := make([]string, days)
+	labels := make([]string, days)
+	for i := 0; i < days; i++ {
+		d := time.Date(ref.Year(), ref.Month(), i+1, 0, 0, 0, 0, ref.Location())
+		keys[i] = d.Format("2006-01-02")
+		labels[i] = d.Format("01-02")
+	}
+	return renderReport(
+		fmt.Sprintf("月活跃度报告  %s", ym),
+		fmt.Sprintf("month_%s_report.txt", ym),
+		deltas, keys, labels,
+	)
+}
+
+// generateYearlyReport 生成 ref 所在年份的年报（按月）
+func generateYearlyReport(hist []record, ref time.Time) error {
+	y := ref.Format("2006")
+	debugf("生成年报: 目标年份=%s (参考日=%s)", y, ref.Format("2006-01-02"))
+	deltas := aggByPeriod(hist, func(r record) bool {
+		return len(r.Timestamp) >= 4 && r.Timestamp[:4] == y
+	}, func(r record) string { return r.Timestamp[:7] })
+
+	keys := make([]string, 12)
+	labels := make([]string, 12)
+	for i := 0; i < 12; i++ {
+		d := time.Date(ref.Year(), time.Month(i+1), 1, 0, 0, 0, 0, ref.Location())
+		keys[i] = d.Format("2006-01")
+		labels[i] = d.Format("2006-01")
+	}
+	return renderReport(
+		fmt.Sprintf("年活跃度报告  %s", y),
+		fmt.Sprintf("year_%s_report.txt", y),
+		deltas, keys, labels,
+	)
+}
+
+// autoGeneratePeriodicReports 检测跨周/跨月/跨年，自动补生成对应报告
+func autoGeneratePeriodicReports(hist []record, prevDay string) {
+	day, err := time.Parse("2006-01-02", prevDay)
+	if err != nil {
+		debugf("周期检测跳过: 日期解析失败 %q: %v", prevDay, err)
+		return
+	}
+	isSunday := day.Weekday() == time.Sunday
+	isMonthEnd := day.AddDate(0, 0, 1).Month() != day.Month()
+	isYearEnd := day.Month() == time.December && day.Day() == 31
+	debugf("周期检测 [%s]: 星期%s | 是否周末=%v 是否月末=%v 是否年末=%v",
+		prevDay, day.Weekday(), isSunday, isMonthEnd, isYearEnd)
+
+	if isSunday {
+		if err := generateWeeklyReport(hist, day); err != nil {
+			log.Printf("生成周报失败: %v", err)
+		} else {
+			log.Printf("已生成周报: %s 所在周", prevDay)
+		}
+	} else {
+		debugf("非周日，不生成周报")
+	}
+	if isMonthEnd {
+		if err := generateMonthlyReport(hist, day); err != nil {
+			log.Printf("生成月报失败: %v", err)
+		} else {
+			log.Printf("已生成月报: %s", day.Format("2006-01"))
+		}
+	} else {
+		debugf("非月末，不生成月报")
+	}
+	if isYearEnd {
+		if err := generateYearlyReport(hist, day); err != nil {
+			log.Printf("生成年报失败: %v", err)
+		} else {
+			log.Printf("已生成年报: %s", day.Format("2006"))
+		}
+	} else {
+		debugf("非年末，不生成年报")
+	}
 }
 
 // runHourly 每小时对齐到整点执行一次
@@ -288,40 +596,101 @@ func runHourly() {
 	// 先对齐到下一个整点
 	now := time.Now()
 	next := now.Add(time.Hour).Truncate(time.Hour)
+	wait := time.Until(next)
 	log.Printf("下次执行时间: %s", next.Format("2006-01-02 15:04:05"))
-	time.Sleep(time.Until(next))
+	debugf("对齐整点: 当前=%s 下次=%s 等待=%v",
+		now.Format("2006-01-02 15:04:05"), next.Format("2006-01-02 15:04:05"), wait)
+	time.Sleep(wait)
 
 	collectOnce()
 	ticker := time.NewTicker(time.Hour)
 	defer ticker.Stop()
-	for range ticker.C {
+	debugf("已进入每小时定时循环 (间隔=1h)")
+	for t := range ticker.C {
+		debugf("定时器触发: %s", t.Format("2006-01-02 15:04:05"))
 		collectOnce()
 	}
 }
 
 func main() {
 	once := flag.Bool("once", false, "只采集一次后退出（用于测试或配合外部计划任务）")
-	reportDay := flag.String("report", "", "手动生成指定日期(YYYY-MM-DD)的日报告，基于本地历史数据")
+	reportDay := flag.String("report", "", "手动生成指定日期(YYYY-MM-DD)的日报，基于本地历史数据")
+	weekDay := flag.String("week", "", "手动生成指定日期所在周的周报 (YYYY-MM-DD)")
+	monthStr := flag.String("month", "", "手动生成指定月份的月报 (YYYY-MM)")
+	yearStr := flag.String("year", "", "手动生成指定年份的年报 (YYYY)")
+	debugFlag := flag.Bool("debug", false, "开启调试日志（打印请求/响应/文件读写等详细信息）")
 	flag.Parse()
+	debugEnabled = *debugFlag
 
 	log.SetFlags(log.LstdFlags)
 	log.Printf("启动 insigmind 统计采集")
+	debugf("调试模式已开启")
+	debugf("命令行参数: once=%v report=%q week=%q month=%q year=%q debug=%v",
+		*once, *reportDay, *weekDay, *monthStr, *yearStr, *debugFlag)
+	debugf("运行时间: %s", time.Now().Format("2006-01-02 15:04:05"))
+	debugf("接口地址: %s", apiURL)
 
 	if *reportDay != "" {
+		debugf("模式: 手动生成日报 (%s)", *reportDay)
 		hist := loadHistory()
 		if err := generateDailyReport(hist, *reportDay); err != nil {
 			log.Fatalf("生成报告失败: %v", err)
 		}
-		log.Printf("已生成日报告: %s", *reportDay)
+		log.Printf("已生成日报: %s", *reportDay)
+		return
+	}
+
+	if *weekDay != "" {
+		debugf("模式: 手动生成周报 (%s)", *weekDay)
+		t, err := time.Parse("2006-01-02", *weekDay)
+		if err != nil {
+			log.Fatalf("日期格式错误: %v", err)
+		}
+		hist := loadHistory()
+		if err := generateWeeklyReport(hist, t); err != nil {
+			log.Fatalf("生成周报失败: %v", err)
+		}
+		log.Printf("已生成周报: %s 所在周", *weekDay)
+		return
+	}
+
+	if *monthStr != "" {
+		debugf("模式: 手动生成月报 (%s)", *monthStr)
+		t, err := time.Parse("2006-01", *monthStr)
+		if err != nil {
+			log.Fatalf("月份格式错误: %v", err)
+		}
+		hist := loadHistory()
+		if err := generateMonthlyReport(hist, t); err != nil {
+			log.Fatalf("生成月报失败: %v", err)
+		}
+		log.Printf("已生成月报: %s", *monthStr)
+		return
+	}
+
+	if *yearStr != "" {
+		debugf("模式: 手动生成年报 (%s)", *yearStr)
+		t, err := time.Parse("2006", *yearStr)
+		if err != nil {
+			log.Fatalf("年份格式错误: %v", err)
+		}
+		hist := loadHistory()
+		if err := generateYearlyReport(hist, t); err != nil {
+			log.Fatalf("生成年报失败: %v", err)
+		}
+		log.Printf("已生成年报: %s", *yearStr)
 		return
 	}
 
 	if *once {
+		debugf("模式: 单次采集")
 		collectOnce()
+		debugf("单次采集结束，程序退出")
 		return
 	}
 
 	// 立即执行一次，然后进入每小时循环
+	debugf("模式: 常驻运行（立即采集一次 + 每小时整点）")
 	collectOnce()
 	runHourly()
 }
