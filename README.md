@@ -20,7 +20,19 @@ go build -o stats.exe main.go
 stats.exe            # 常驻：立即采集一次，之后每小时整点自动采集
 stats.exe --once     # 仅采集一次后退出（适合配合系统计划任务）
 stats.exe -debug     # 开启调试日志（可与其他参数组合）
+stats.exe -version   # 打印版本号后退出
 ```
+
+### 版本号
+程序启动时会在日志中打印版本号（同时写入 `logs/` 与控制台）：
+```
+2026/09/02 06:10:00 启动 insigmind 统计采集 v1.2.3
+```
+默认版本号为 `dev`。发布时通过 ldflags 注入：
+```bash
+go build -ldflags "-X main.version=1.2.3" -o stats.exe main.go
+```
+守护脚本热更新后，可从 `glean.log` 中的该行确认实际运行的是哪个版本。
 
 ### 调试日志（-debug）
 开启后额外打印 `[DEBUG]` 前缀的详细日志（同时写入控制台和 `logs/`），覆盖：

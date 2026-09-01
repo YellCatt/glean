@@ -45,6 +45,13 @@ type record struct {
 // reportHour 每天生成报告的整点小时（按东八区计）
 const reportHour = 5
 
+// version 程序版本号，默认 dev；构建时可用 ldflags 注入，例如：
+//
+//	go build -ldflags "-X main.version=1.2.3" -o stats.exe main.go
+//
+// 之所以用 var 而非 const，正是为了让 -X 能在链接期覆盖它。
+var version = "dev"
+
 // chinaLoc 程序统一使用的时区：东八区（Asia/Shanghai / UTC+8）
 // 优先从系统时区数据库加载；若运行环境无 tzdata（如精简路由器固件），
 // 则退化为固定的 +8 小时偏移，保证行为一致。
@@ -666,13 +673,19 @@ func main() {
 	weekDay := flag.String("week", "", "手动生成指定日期所在周的周报 (YYYY-MM-DD)")
 	monthStr := flag.String("month", "", "手动生成指定月份的月报 (YYYY-MM)")
 	yearStr := flag.String("year", "", "手动生成指定年份的年报 (YYYY)")
+	showVersion := flag.Bool("version", false, "打印程序版本号后退出")
 	debugFlag := flag.Bool("debug", false, "开启调试日志（打印请求/响应/文件读写等详细信息）")
 	flag.Parse()
 	debugEnabled = *debugFlag
 
 	log.SetFlags(log.LstdFlags)
-	log.Printf("启动 insigmind 统计采集")
+	if *showVersion {
+		log.Printf("insigmind 统计采集 v%s", version)
+		return
+	}
+	log.Printf("启动 insigmind 统计采集 v%s", version)
 	debugf("调试模式已开启")
+	debugf("版本: %s", version)
 	debugf("命令行参数: once=%v report=%q week=%q month=%q year=%q debug=%v",
 		*once, *reportDay, *weekDay, *monthStr, *yearStr, *debugFlag)
 	debugf("运行时间: %s", nowCST().Format("2006-01-02 15:04:05"))
