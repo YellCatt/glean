@@ -7,6 +7,13 @@
 - 方法: GET
 - URL: https://api.insigmind.com/Api/WebLogin/GetIndexStats
 
+## 时区
+程序内部**统一使用东八区（Asia/Shanghai / UTC+8）**，与运行环境所在系统时区无关：
+- 采集时间戳、日志文件名（按天切分）、每天 5:00 的报告调度、周/月/年周期判定，均以东八区为准
+- 优先读取系统时区数据库中的 `Asia/Shanghai`；若运行环境无 tzdata（如精简路由器固件），
+  自动退化为固定 `+08:00` 偏移，两种情况下行为一致
+- 因此部署在 UTC 或其他时区的机器上时，无需额外调整
+
 ## 构建与运行
 ```bash
 go build -o stats.exe main.go
@@ -30,10 +37,12 @@ stats.exe -debug     # 开启调试日志（可与其他参数组合）
 
 | 报告 | 文件名 | 粒度 | 自动触发时机 |
 |------|--------|------|--------------|
-| 日报 | `YYYY-MM-DD_report.txt` | 每小时 | 跨天时自动为**上一天**生成 |
-| 周报 | `week_YYYY-MM-DD_report.txt`（周一日期） | 每天（周一~周日） | 每周日跨天时自动生成上周 |
-| 月报 | `month_YYYY-MM_report.txt` | 每天 | 每月末跨天时自动生成上月 |
-| 年报 | `year_YYYY_report.txt` | 每月 | 每年 12/31 跨天时自动生成去年 |
+| 日报 | `YYYY-MM-DD_report.txt` | 每小时 | 每天早上 **5:00** 自动为**前一天**生成 |
+| 周报 | `week_YYYY-MM-DD_report.txt`（周一日期） | 每天（周一~周日） | 每周一 **5:00** 自动生成上周（前一天为周日时） |
+| 月报 | `month_YYYY-MM_report.txt` | 每天 | 每月 1 日 **5:00** 自动生成上月（前一天为月末时） |
+| 年报 | `year_YYYY_report.txt` | 每月 | 每年 1/1 **5:00** 自动生成去年（前一天为 12/31 时） |
+
+> 表中所有时刻均为**东八区时间**。
 
 手动补生成（基于本地 `stats_history.json` 历史数据）：
 ```bash

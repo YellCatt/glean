@@ -42,13 +42,46 @@ type record struct {
 	Contact   int64  `json:"contactCount"`
 }
 
+// reportHour 每天生成报告的整点小时（按东八区计）
+const reportHour = 5
+
+// chinaLoc 程序统一使用的时区：东八区（Asia/Shanghai / UTC+8）
+// 优先从系统时区数据库加载；若运行环境无 tzdata（如精简路由器固件），
+// 则退化为固定的 +8 小时偏移，保证行为一致。
+var chinaLoc *time.Location
+
+func initChinaLoc() {
+	if loc, err := time.LoadLocation("Asia/Shanghai"); err == nil && loc != nil {
+		chinaLoc = loc
+	} else {
+		chinaLoc = time.FixedZone("CST", 8*60*60)
+	}
+}
+
+// nowCST 返回当前东八区时间（程序内所有"当前时间"均必须走此函数）
+func nowCST() time.Time {
+	if chinaLoc == nil {
+		initChinaLoc()
+	}
+	return time.Now().In(chinaLoc)
+}
+
+// parseInCST 按东八区解析时间字符串（避免 time.Parse 默认落到 UTC 导致日期偏移）
+func parseInCST(layout, value string) (time.Time, error) {
+	if chinaLoc == nil {
+		initChinaLoc()
+	}
+	return time.ParseInLocation(layout, value, chinaLoc)
+}
+
 var (
-	historyFile  string
-	logFile      string
-	reportsDir   string
-	logsDir      string
-	debugEnabled bool
-	collectCount int // 本次进程内已完成的采集次数
+	historyFile   string
+	logFile       string
+	reportsDir    string
+	logsDir       string
+	debugEnabled  bool
+	collectCount  int    // 本次进程内已完成的采集次数
+	lastReportDay string // 本次进程内已生成报告的"昨天"日期(YYYY-MM-DD)，避免重复生成
 )
 
 // initDebug 在 flag.Parse 之前扫描命令行，使 init 阶段的日志也能受 -debug 控制
@@ -66,7 +99,7 @@ func debugf(format string, args ...any) {
 	if !debugEnabled {
 		return
 	}
-	log.Printf("[DEBUG] ["+time.Now().Format("15:04:05.000")+"] "+format, args...)
+	log.Printf("[DEBUG] ["+nowCST().Format("15:04:05.000")+"] "+format, args...)
 }
 
 // truncate 截断长字符串，避免调试日志被超长响应体撑爆
@@ -79,6 +112,7 @@ func truncate(s string, max int) string {
 
 func init() {
 	initDebug()
+	initChinaLoc() // 必须先于任何时间处理，确保日志/采集/报告全部使用东八区
 	log.SetOutput(os.Stdout) // 避免 setupLogger 之前的日志落到 stderr
 	dir, err := os.Getwd()
 	if err != nil {
@@ -102,7 +136,7 @@ func init() {
 
 // setupLogger 将日志同时输出到 stdout 和 ./logs/glean_YYYY-MM-DD.log
 func setupLogger() {
-	today := time.Now().Format("2006-01-02")
+	today := nowCST().Format("2006-01-02")
 	logPath := filepath.Join(logsDir, "glean_"+today+".log")
 	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
@@ -131,7 +165,7 @@ func fetchStats() (*record, error) {
 	req.Header.Set("User-Agent", "Apifox/1.0.0 (https://apifox.com)")
 	debugf("请求头: User-Agent=%q, Host=%q", req.Header.Get("User-Agent"), req.URL.Host)
 
-	start := time.Now()
+	start := nowCST()
 	resp, err := client.Do(req)
 	elapsed := time.Since(start)
 	if err != nil {
@@ -166,7 +200,7 @@ func fetchStats() (*record, error) {
 	}
 
 	rec := &record{
-		Timestamp: time.Now().Format("2006-01-02 15:04:05"),
+		Timestamp: nowCST().Format("2006-01-02 15:04:05"),
 		Search:    ar.Data.SearchCount,
 		Contact:   ar.Data.ContactCount,
 	}
@@ -273,7 +307,8 @@ func appendLog(cur record, prev *record) error {
 
 // collectOnce 执行一次采集
 func collectOnce() {
-	start := time.Now()
+	start := nowCST()
+	setupLogger() // 确保日志文件按当天切分
 	log.Printf("===== 开始第 %d 次采集 =====", collectCount+1)
 	hist := loadHistory()
 	var prev *record
@@ -311,27 +346,6 @@ func collectOnce() {
 		}
 	}
 	collectCount++
-
-	// 跨天检测：若当天日期与上一条记录不同，则为"上一天"生成日报，并检测周/月/年报告
-	curDay := cur.Timestamp[:10]
-	if prev != nil {
-		prevDay := prev.Timestamp[:10]
-		debugf("跨天检测: 当前=%s 上一条=%s", curDay, prevDay)
-		if prevDay != curDay {
-			log.Printf("检测到跨天: %s -> %s，开始生成 %s 的报告", prevDay, curDay, prevDay)
-			setupLogger() // 切换到新一天的日志文件
-			if err := generateDailyReport(hist, prevDay); err != nil {
-				log.Printf("生成日报失败 [%s]: %v", prevDay, err)
-			} else {
-				log.Printf("已生成日报: %s", prevDay)
-			}
-			autoGeneratePeriodicReports(hist, prevDay)
-		} else {
-			debugf("未跨天，跳过报告生成")
-		}
-	} else {
-		debugf("首次采集，无上一天可比，跳过报告生成")
-	}
 	debugf("本次采集总耗时: %v", time.Since(start))
 }
 
@@ -444,7 +458,7 @@ func renderReport(title, fileName string, deltas map[string][2]int64, keys, labe
 
 // generateDailyReport 生成某天的日报（按小时）
 func generateDailyReport(hist []record, targetDay string) error {
-	day, err := time.Parse("2006-01-02", targetDay)
+	day, err := parseInCST("2006-01-02", targetDay)
 	if err != nil {
 		return err
 	}
@@ -512,11 +526,11 @@ func generateMonthlyReport(hist []record, ref time.Time) error {
 		return len(r.Timestamp) >= 7 && r.Timestamp[:7] == ym
 	}, func(r record) string { return r.Timestamp[:10] })
 
-	days := time.Date(ref.Year(), ref.Month()+1, 0, 0, 0, 0, 0, ref.Location()).Day()
+	days := time.Date(ref.Year(), ref.Month()+1, 0, 0, 0, 0, 0, chinaLoc).Day()
 	keys := make([]string, days)
 	labels := make([]string, days)
 	for i := 0; i < days; i++ {
-		d := time.Date(ref.Year(), ref.Month(), i+1, 0, 0, 0, 0, ref.Location())
+		d := time.Date(ref.Year(), ref.Month(), i+1, 0, 0, 0, 0, chinaLoc)
 		keys[i] = d.Format("2006-01-02")
 		labels[i] = d.Format("01-02")
 	}
@@ -538,7 +552,7 @@ func generateYearlyReport(hist []record, ref time.Time) error {
 	keys := make([]string, 12)
 	labels := make([]string, 12)
 	for i := 0; i < 12; i++ {
-		d := time.Date(ref.Year(), time.Month(i+1), 1, 0, 0, 0, 0, ref.Location())
+		d := time.Date(ref.Year(), time.Month(i+1), 1, 0, 0, 0, 0, chinaLoc)
 		keys[i] = d.Format("2006-01")
 		labels[i] = d.Format("2006-01")
 	}
@@ -551,7 +565,7 @@ func generateYearlyReport(hist []record, ref time.Time) error {
 
 // autoGeneratePeriodicReports 检测跨周/跨月/跨年，自动补生成对应报告
 func autoGeneratePeriodicReports(hist []record, prevDay string) {
-	day, err := time.Parse("2006-01-02", prevDay)
+	day, err := parseInCST("2006-01-02", prevDay)
 	if err != nil {
 		debugf("周期检测跳过: 日期解析失败 %q: %v", prevDay, err)
 		return
@@ -591,10 +605,35 @@ func autoGeneratePeriodicReports(hist []record, prevDay string) {
 	}
 }
 
-// runHourly 每小时对齐到整点执行一次
+// generateReportsForYesterday 为"昨天"生成日报；若昨天为周日/月末/年末，
+// 则同时补生成周报/月报/年报（每天早上 5:00 调用）
+func generateReportsForYesterday() {
+	yesterday := nowCST().AddDate(0, 0, -1).Format("2006-01-02")
+	if lastReportDay == yesterday {
+		debugf("今日 %s 的报告已在本次进程中生成过，跳过", yesterday)
+		return
+	}
+	lastReportDay = yesterday
+	log.Printf("===== 开始生成 %s 的报告 =====", yesterday)
+	hist := loadHistory()
+	if err := generateDailyReport(hist, yesterday); err != nil {
+		log.Printf("生成日报失败 [%s]: %v", yesterday, err)
+	} else {
+		log.Printf("已生成日报: %s", yesterday)
+	}
+	// 前一天为周日/月末/年末时，补生成周报/月报/年报
+	autoGeneratePeriodicReports(hist, yesterday)
+}
+
+// runHourly 每小时对齐到整点执行一次（所有时刻判定均基于东八区）
 func runHourly() {
+	// 启动时刻若正处于 5 点时段（东八区 5:00~5:59），先补生成昨日报告，避免错过
+	if nowCST().Hour() == reportHour {
+		generateReportsForYesterday()
+	}
+
 	// 先对齐到下一个整点
-	now := time.Now()
+	now := nowCST()
 	next := now.Add(time.Hour).Truncate(time.Hour)
 	wait := time.Until(next)
 	log.Printf("下次执行时间: %s", next.Format("2006-01-02 15:04:05"))
@@ -603,12 +642,21 @@ func runHourly() {
 	time.Sleep(wait)
 
 	collectOnce()
+	// 对齐到整点后若恰为东八区 5 点（如 4:59 启动），补生成昨日报告
+	if nowCST().Hour() == reportHour {
+		generateReportsForYesterday()
+	}
 	ticker := time.NewTicker(time.Hour)
 	defer ticker.Stop()
 	debugf("已进入每小时定时循环 (间隔=1h)")
 	for t := range ticker.C {
-		debugf("定时器触发: %s", t.Format("2006-01-02 15:04:05"))
+		tc := t.In(chinaLoc) // ticker 返回本地时间，显式转为东八区
+		debugf("定时器触发: %s", tc.Format("2006-01-02 15:04:05"))
 		collectOnce()
+		// 每天早上东八区 5:00 整点，为前一天生成日报及周期报告
+		if tc.Hour() == reportHour {
+			generateReportsForYesterday()
+		}
 	}
 }
 
@@ -627,7 +675,7 @@ func main() {
 	debugf("调试模式已开启")
 	debugf("命令行参数: once=%v report=%q week=%q month=%q year=%q debug=%v",
 		*once, *reportDay, *weekDay, *monthStr, *yearStr, *debugFlag)
-	debugf("运行时间: %s", time.Now().Format("2006-01-02 15:04:05"))
+	debugf("运行时间: %s", nowCST().Format("2006-01-02 15:04:05"))
 	debugf("接口地址: %s", apiURL)
 
 	if *reportDay != "" {
@@ -642,7 +690,7 @@ func main() {
 
 	if *weekDay != "" {
 		debugf("模式: 手动生成周报 (%s)", *weekDay)
-		t, err := time.Parse("2006-01-02", *weekDay)
+		t, err := parseInCST("2006-01-02", *weekDay)
 		if err != nil {
 			log.Fatalf("日期格式错误: %v", err)
 		}
@@ -656,7 +704,7 @@ func main() {
 
 	if *monthStr != "" {
 		debugf("模式: 手动生成月报 (%s)", *monthStr)
-		t, err := time.Parse("2006-01", *monthStr)
+		t, err := parseInCST("2006-01", *monthStr)
 		if err != nil {
 			log.Fatalf("月份格式错误: %v", err)
 		}
@@ -670,7 +718,7 @@ func main() {
 
 	if *yearStr != "" {
 		debugf("模式: 手动生成年报 (%s)", *yearStr)
-		t, err := time.Parse("2006", *yearStr)
+		t, err := parseInCST("2006", *yearStr)
 		if err != nil {
 			log.Fatalf("年份格式错误: %v", err)
 		}
