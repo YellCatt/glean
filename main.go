@@ -107,9 +107,10 @@ var (
 
 // initDebug 在 flag.Parse 之前扫描命令行，使 init 阶段的日志也能受 -debug 控制
 func initDebug() {
+	debugEnabled = true
 	for _, a := range os.Args[1:] {
-		if a == "-debug" || a == "--debug" || a == "-debug=true" || a == "--debug=true" {
-			debugEnabled = true
+		if a == "-debug=false" || a == "--debug=false" {
+			debugEnabled = false
 			return
 		}
 	}
@@ -827,7 +828,7 @@ func main() {
 	monthStr := flag.String("month", "", "手动生成指定月份的月报 (YYYY-MM)")
 	yearStr := flag.String("year", "", "手动生成指定年份的年报 (YYYY)")
 	showVersion := flag.Bool("version", false, "打印程序版本号后退出")
-	debugFlag := flag.Bool("debug", false, "开启调试日志（打印请求/响应/文件读写等详细信息）")
+	debugFlag := flag.Bool("debug", true, "开启调试日志（打印请求/响应/文件读写等详细信息）")
 	flag.Parse()
 	debugEnabled = *debugFlag
 
