@@ -86,6 +86,7 @@ var (
 	logFile       string
 	reportsDir    string
 	logsDir       string
+	sqlDir        string
 	debugEnabled  bool
 	collectCount  int    // 本次进程内已完成的采集次数
 	lastReportDay string // 本次进程内已生成报告的"昨天"日期(YYYY-MM-DD)，避免重复生成
@@ -127,7 +128,8 @@ func init() {
 		dir = "."
 	}
 	historyFile = filepath.Join(dir, "stats_history.json")
-	logFile = filepath.Join(dir, "stats_log.csv")
+	sqlDir = filepath.Join(dir, "sql")
+	logFile = filepath.Join(sqlDir, "stats_log.csv")
 	reportsDir = filepath.Join(dir, "reports")
 	logsDir = filepath.Join(dir, "logs")
 	debugf("工作目录: %s", dir)
@@ -137,7 +139,11 @@ func init() {
 	if err := os.MkdirAll(logsDir, 0755); err != nil {
 		log.Printf("警告: 无法创建日志目录 %s: %v", logsDir, err)
 	}
-	debugf("路径配置: 历史=%s | CSV=%s | 报告目录=%s | 日志目录=%s", historyFile, logFile, reportsDir, logsDir)
+	if err := os.MkdirAll(sqlDir, 0755); err != nil {
+		log.Printf("警告: 无法创建数据目录 %s: %v", sqlDir, err)
+	}
+	debugf("路径配置: 历史=%s | CSV=%s | 报告目录=%s | 日志目录=%s | 数据目录=%s",
+		historyFile, logFile, reportsDir, logsDir, sqlDir)
 	setupLogger()
 }
 
@@ -546,7 +552,7 @@ func renderReport(title, fileName string, deltas map[string][2]int64, keys, labe
 	fmt.Fprintf(w, "覆盖周期数(有增量): %d / %d\n\n", active, len(keys))
 	debugf("渲染报告: 标题=%q 周期数=%d 有增量周期=%d", title, len(keys), active)
 	if summary != "" {
-		fmt.Fprintf(w, "%s", summary)
+		fmt.Fprint(w, summary)
 	}
 
 	renderBarSection(w, "累计寻源次数", deltas, keys, labels, 0)
