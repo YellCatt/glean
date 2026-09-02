@@ -11,7 +11,7 @@ DOWNLOAD_URL="https://github.com/YellCatt/glean/releases/download/dev-latest/def
 MAX_RETRY=20
 RESTART_DELAY=5
 MAX_RESTART_DELAY=300
-UPDATE_INTERVAL=14400         # 172800 秒 = 48 小时 14400 秒 = 4小时
+UPDATE_INTERVAL=14400         # 14400 秒 = 4 小时
 GRACEFUL_SHUTDOWN_TIMEOUT=10
 
 # 下载超时配置
