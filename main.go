@@ -605,6 +605,9 @@ func renderReport(title, fileName string, deltas map[string][2]int64, keys, labe
 
 	content := b.String()
 	outPath := filepath.Join(reportsDir, fileName)
+	if err := os.MkdirAll(filepath.Dir(outPath), 0755); err != nil {
+		return "", fmt.Errorf("创建报告子目录失败: %w", err)
+	}
 	debugf("写入报告文件: %s (%d 字节)", outPath, len(content))
 	if err := os.WriteFile(outPath, []byte(content), 0644); err != nil {
 		debugf("报告文件写入失败: %s: %v", outPath, err)
@@ -650,7 +653,7 @@ func generateDailyReport(hist []record, targetDay string) (string, error) {
 	if ok {
 		log.Printf("日报 [%s] 当日总增量: 寻源 %+d, 触达 %+d", dayStr, ds, dc)
 	}
-	return renderReport(fmt.Sprintf("日活跃度报告  %s", dayStr), targetDay+"_report.txt", deltas, keys, labels, summary)
+	return renderReport(fmt.Sprintf("日活跃度报告  %s", dayStr), "daily/daily_"+targetDay+"_report.txt", deltas, keys, labels, summary)
 }
 
 // generateWeeklyReport 生成 ref 所在周的周报（周一~周日，按天）
@@ -675,7 +678,7 @@ func generateWeeklyReport(hist []record, ref time.Time) (string, error) {
 	}
 	return renderReport(
 		fmt.Sprintf("周活跃度报告  %s ~ %s", startStr, endStr),
-		fmt.Sprintf("week_%s_report.txt", startStr),
+		fmt.Sprintf("week/week_%s_report.txt", startStr),
 		deltas, keys, labels, buildPeriodSummary(deltas, keys, "日均"),
 	)
 }
@@ -698,7 +701,7 @@ func generateMonthlyReport(hist []record, ref time.Time) (string, error) {
 	}
 	return renderReport(
 		fmt.Sprintf("月活跃度报告  %s", ym),
-		fmt.Sprintf("month_%s_report.txt", ym),
+		fmt.Sprintf("month/month_%s_report.txt", ym),
 		deltas, keys, labels, buildPeriodSummary(deltas, keys, "日均"),
 	)
 }
@@ -720,7 +723,7 @@ func generateYearlyReport(hist []record, ref time.Time) (string, error) {
 	}
 	return renderReport(
 		fmt.Sprintf("年活跃度报告  %s", y),
-		fmt.Sprintf("year_%s_report.txt", y),
+		fmt.Sprintf("year/year_%s_report.txt", y),
 		deltas, keys, labels, buildPeriodSummary(deltas, keys, "月均"),
 	)
 }
