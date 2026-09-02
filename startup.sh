@@ -3,7 +3,7 @@
 PLUGIN_DIR="/plugins/data/glean"
 BINARY_NAME="glean"
 TMP_NAME="glean.tmp"
-LOG_FILE="$PLUGIN_DIR/glean.log"
+LOG_FILE="$PLUGIN_DIR/logs/glean.log"
 PID_FILE="$PLUGIN_DIR/glean.pid"
 DOWNLOAD_URL="https://github.com/YellCatt/glean/releases/download/dev-latest/default.glean_linux_mipsle"
 MAX_RETRY=20
@@ -73,7 +73,6 @@ fi
 echo $$ > "$PID_FILE"
 log_ok "PID 文件已写入: $PID_FILE (当前 PID: $$)"
 # ============ 等待网络就绪 ============
-# glean 需要请求 https://api.insigmind.com，必须等网络与 DNS 可用后再启动
 log_step "等待网络就绪..."
 NETWORK_WAIT=0
 while true; do
@@ -102,41 +101,52 @@ else
     log_ok "目录已存在: $PLUGIN_DIR"
 fi
 # ============ 进入插件目录 ============
-# 必须 cd，glean 会把 stats_history.json / stats_log.csv / reports / logs 写在当前工作目录
 cd "$PLUGIN_DIR" || {
     log_error "进入目录失败: $PLUGIN_DIR"
     exit 1
 }
 
-# ============ 解析.last_update_check，兼容旧2字段格式 ============
+# ============ 解析 .last_update_check ============
+# 新格式：last_check_ts|last_human|next_check_ts_num|next_check_human
+# 兼容旧3字段/旧2字段自动升级
 parse_update_file() {
     local last_check_ts=0
     local last_human=""
-    local next_check_ts=0
+    local next_check_ts_num=0
+    local next_check_human=""
     if [ -f ".last_update_check" ]; then
         LINE=$(cat ".last_update_check" 2>/dev/null)
-        # 旧格式：last_check_ts|last_human
-        # 新格式：last_check_ts|last_human|next_check_ts
         case "$LINE" in
-            *\|*\|*)
+            *\|*\|*\|*)
+                # 4字段新格式
                 last_check_ts=$(echo "$LINE" | cut -d'|' -f1)
                 last_human=$(echo "$LINE" | cut -d'|' -f2)
-                next_check_ts=$(echo "$LINE" | cut -d'|' -f3)
+                next_check_ts_num=$(echo "$LINE" | cut -d'|' -f3)
+                next_check_human=$(echo "$LINE" | cut -d'|' -f4)
+                ;;
+            *\|*\|*)
+                # 旧3字段：last|last_h|next_num，缺少next_human
+                last_check_ts=$(echo "$LINE" | cut -d'|' -f1)
+                last_human=$(echo "$LINE" | cut -d'|' -f2)
+                next_check_ts_num=$(echo "$LINE" | cut -d'|' -f3)
+                next_check_human="(未记录，旧配置)"
                 ;;
             *\|*)
+                # 旧2字段
                 last_check_ts=$(echo "$LINE" | cut -d'|' -f1)
                 last_human=$(echo "$LINE" | cut -d'|' -f2)
-                # 旧文件没有next，自动推算
-                next_check_ts=$((last_check_ts + UPDATE_INTERVAL))
+                next_check_ts_num=$((last_check_ts + UPDATE_INTERVAL))
+                next_check_human="(未记录，旧配置)"
                 ;;
             *)
                 last_check_ts=0
                 last_human=""
-                next_check_ts=0
+                next_check_ts_num=0
+                next_check_human=""
                 ;;
         esac
     fi
-    echo "$last_check_ts|$last_human|$next_check_ts"
+    echo "$last_check_ts|$last_human|$next_check_ts_num|$next_check_human"
 }
 
 # ============ 将秒数转换为人类可读的时长 ============
@@ -161,9 +171,15 @@ download_binary() {
     retry=0
     while [ "$retry" -lt "$MAX_RETRY" ]; do
         retry=$((retry + 1))
-        log_info "第 $retry / $MAX_RETRY 次下载尝试 (连接超时 ${CONNECT_TIMEOUT}s, 最大耗时 ${MAX_DOWNLOAD_TIME}s)..."
-        curl -L -k --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_DOWNLOAD_TIME" -o "$TMP_NAME" "$DOWNLOAD_URL"
+        start_wall=$(date '+%Y-%m-%d %H:%M:%S')
+        log_info "第 $retry / $MAX_RETRY 次下载尝试，开始时刻:${start_wall} (连接超时 ${CONNECT_TIMEOUT}s, 最大耗时 ${MAX_DOWNLOAD_TIME}s)"
+
+        curl -L -k --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_DOWNLOAD_TIME" -s -o "$TMP_NAME" "$DOWNLOAD_URL"
         curl_exit=$?
+
+        end_wall=$(date '+%Y-%m-%d %H:%M:%S')
+        log_info "第 $retry 次下载结束时刻:${end_wall}, curl退出码=${curl_exit}"
+
         if [ "$curl_exit" -eq 0 ] && [ -f "$TMP_NAME" ] && [ -s "$TMP_NAME" ]; then
             size=$(ls -lh "$TMP_NAME" | awk '{print $5}')
             chmod +x "$TMP_NAME"
@@ -222,26 +238,29 @@ check_and_update() {
     PARSED=$(parse_update_file)
     last_check_ts=$(echo "$PARSED" | cut -d'|' -f1)
     last_human=$(echo "$PARSED" | cut -d'|' -f2)
-    next_check_ts=$(echo "$PARSED" | cut -d'|' -f3)
+    next_check_ts_num=$(echo "$PARSED" | cut -d'|' -f3)
 
-    # 未到预计下次时间，直接返回
-    if [ "$now" -lt "$next_check_ts" ]; then
+    # 调度判断只使用数字时间戳
+    if [ "$now" -lt "$next_check_ts_num" ]; then
         return 0
     fi
 
     elapsed=$((now - last_check_ts))
     log_step "距离上次更新已 $(format_duration $elapsed)，开始下载最新版本..."
 
-    # 计算新的下次检查时间
     new_last_ts=$now
     new_last_human=$(date '+%Y-%m-%d %H:%M:%S %Z (UTC%z)')
-    new_next_ts=$((new_last_ts + UPDATE_INTERVAL))
-    # 写入新格式 last_check_ts|last_human|next_check_ts
-    echo "${new_last_ts}|${new_last_human}|${new_next_ts}" > .last_update_check
+    new_next_ts_num=$((new_last_ts + UPDATE_INTERVAL))
+    # 关键点：当场算出下次可读时间字符串存入变量
+    new_next_human=$(date '+%Y-%m-%d %H:%M:%S %Z (UTC%z)' -d "@${new_next_ts_num}" 2>/dev/null)
+    # 兜底：busybox‑date不支持‑d @时，填提示文字
+    if [ -z "$new_next_human" ]; then
+        new_next_human="BusyBox‑date不支持时间戳转换，时间戳=${new_next_ts_num}"
+    fi
 
-    # 打印下次时间日志
-    next_human=$(date -d "@${new_next_ts}" '+%Y-%m-%d %H:%M:%S')
-    log_info "本次更新检查完成，预计下次更新检查: ${next_human} (ts=${new_next_ts})"
+    # 写入4字段格式文件
+    echo "${new_last_ts}|${new_last_human}|${new_next_ts_num}|${new_next_human}" > .last_update_check
+    log_info "本次更新检查完成，预计下次更新检查: ${new_next_human} (ts=${new_next_ts_num})"
 
     if download_binary; then
         if [ -f "$BINARY_NAME" ]; then
@@ -264,7 +283,6 @@ check_and_update() {
 
 # ============ 主守护循环 ============
 main_loop() {
-    # ========== 启动时：优先启动本地版本，避免下载阻塞 ==========
     if ! start_program; then
         log_warn "本地版本不存在，尝试下载..."
         if download_binary; then
@@ -280,18 +298,20 @@ main_loop() {
     fi
     CURRENT_DELAY=$RESTART_DELAY
 
-    # 初始化更新记录
+    # 初始化4字段更新记录
     init_now=$(date +%s)
     init_human=$(date '+%Y-%m-%d %H:%M:%S %Z (UTC%z)')
-    init_next=$((init_now + UPDATE_INTERVAL))
-    echo "${init_now}|${init_human}|${init_next}" > .last_update_check
-    next_human_init=$(date -d "@${init_next}" '+%Y-%m-%d %H:%M:%S')
-    log_info "初始化更新记录，预计下次更新检查: ${next_human_init} (ts=${init_next})"
+    init_next_num=$((init_now + UPDATE_INTERVAL))
+    init_next_human=$(date '+%Y-%m-%d %H:%M:%S %Z (UTC%z)' -d "@${init_next_num}" 2>/dev/null)
+    if [ -z "$init_next_human" ]; then
+        init_next_human="BusyBox‑date不支持时间戳转换，时间戳=${init_next_num}"
+    fi
+    echo "${init_now}|${init_human}|${init_next_num}|${init_next_human}" > .last_update_check
+    log_info "初始化更新记录，预计下次更新检查: ${init_next_human} (ts=${init_next_num})"
 
     FIRST_CHECK=1
     while [ "$RUNNING" -eq 1 ]; do
         if [ -n "$CHILD_PID" ] && [ -d "/proc/$CHILD_PID" ]; then
-            # 程序正常运行中
             if [ "$FIRST_CHECK" -eq 1 ]; then
                 log_step "程序已启动，立即后台检查新版本..."
                 FIRST_CHECK=0
@@ -326,7 +346,6 @@ main_loop() {
                 sleep 10
             fi
         else
-            # 程序已退出（异常或正常）
             if [ -n "$CHILD_PID" ]; then
                 wait "$CHILD_PID" 2>/dev/null
                 EXIT_CODE=$?
@@ -335,14 +354,12 @@ main_loop() {
                 if [ "$EXIT_CODE" -eq 0 ]; then
                     log_info "状态: 正常退出"
                 elif [ "$EXIT_CODE" -eq 143 ] || [ "$EXIT_CODE" -eq 130 ]; then
-                    # 143 = SIGTERM(守护脚本主动停止/热更新)，130 = SIGINT
                     log_info "状态: 被信号终止（守护脚本主动停止或热更新，属正常）"
                 else
                     log_error "状态: 异常退出"
                 fi
                 CHILD_PID=""
             fi
-            # 退出后先尝试更新
             check_and_update
             if [ "$NEED_UPDATE" -eq 1 ]; then
                 [ -f "$BINARY_NAME" ] && rm -f "$BINARY_NAME"
@@ -350,7 +367,6 @@ main_loop() {
                 log_ok "已更新到新版本"
                 NEED_UPDATE=0
             fi
-            # 指数退避重启
             log_info "等待 ${CURRENT_DELAY} 秒后重启..."
             sleep "$CURRENT_DELAY"
             CURRENT_DELAY=$((CURRENT_DELAY * 2))
@@ -366,6 +382,5 @@ main_loop() {
     done
 }
 
-# ============ 启动 ============
 main_loop
 cleanup
