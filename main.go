@@ -45,12 +45,22 @@ type record struct {
 // reportHour 每天生成报告的整点小时（按东八区计）
 const reportHour = 5
 
-// version 程序版本号，默认 dev；构建时可用 ldflags 注入，例如：
+// version 程序版本号 = 构建时间（东八区 YYYY-MM-DD_HH-MM-SS），由 GitHub Actions 在构建时注入：
 //
-//	go build -ldflags "-X main.version=1.2.3" -o stats.exe main.go
+//	go build -ldflags "-X main.version=2026-09-02_14-30-05" -o glean main.go
 //
 // 之所以用 var 而非 const，正是为了让 -X 能在链接期覆盖它。
+// 本地直接 go build 未注入时，保持默认值 "dev"。
 var version = "dev"
+
+// versionKey 日志中打印版本号时使用的固定关键字。
+// 日志行格式统一为 "... version=<构建时间>"，便于在 logs/ 或 glean.log 中 grep "version=" 检索。
+const versionKey = "version"
+
+// logVersion 以固定关键字打印版本号（同时写入控制台与当天日志文件）
+func logVersion() {
+	log.Printf("[glean] %s=%s (构建时间, 东八区)", versionKey, version)
+}
 
 // chinaLoc 程序统一使用的时区：东八区（Asia/Shanghai / UTC+8）
 // 优先从系统时区数据库加载；若运行环境无 tzdata（如精简路由器固件），
@@ -90,6 +100,8 @@ var (
 	debugEnabled  bool
 	collectCount  int    // 本次进程内已完成的采集次数
 	lastReportDay string // 本次进程内已生成报告的"昨天"日期(YYYY-MM-DD)，避免重复生成
+
+	currentLogPath string // 当前正在写入的日志文件路径，跨天后重新初始化时补打版本号
 )
 
 // initDebug 在 flag.Parse 之前扫描命令行，使 init 阶段的日志也能受 -debug 控制
@@ -100,6 +112,28 @@ func initDebug() {
 			return
 		}
 	}
+}
+
+// cstLogWriter 接管日志的时间戳输出。
+// Go 标准库 log 包的前缀时间固定使用**系统本地时区**（如 UTC 机器上会打印 UTC 时间），
+// 与本程序"统一东八区"的约定不一致。这里关掉 log 自带的时间戳（log.SetFlags(0)），
+// 改由本 Writer 在每条记录前补一个东八区时间戳，使控制台与日志文件的时间口径完全一致。
+type cstLogWriter struct{ w io.Writer }
+
+func (c cstLogWriter) Write(p []byte) (int, error) {
+	body := strings.TrimRight(string(p), "\r\n")
+	if body == "" {
+		return len(p), nil // 空行原样放过，不补时间戳
+	}
+	if _, err := io.WriteString(c.w, nowCST().Format("2006/01/02 15:04:05")+" "+body+"\n"); err != nil {
+		return 0, err
+	}
+	return len(p), nil // 必须返回原始长度，否则 log 包会误判为写入失败
+}
+
+// setLogOutput 设置日志输出目标，并统一套上东八区时间戳
+func setLogOutput(w io.Writer) {
+	log.SetOutput(cstLogWriter{w: w})
 }
 
 // debugf 输出调试日志（前缀 [DEBUG] + 毫秒时间），仅在 -debug 开启时打印
@@ -121,7 +155,8 @@ func truncate(s string, max int) string {
 func init() {
 	initDebug()
 	initChinaLoc() // 必须先于任何时间处理，确保日志/采集/报告全部使用东八区
-	log.SetOutput(os.Stdout) // 避免 setupLogger 之前的日志落到 stderr
+	log.SetFlags(0)             // 时间戳改由 cstLogWriter 以东八区输出
+	setLogOutput(os.Stdout)     // 避免 setupLogger 之前的日志落到 stderr
 	dir, err := os.Getwd()
 	if err != nil {
 		debugf("获取当前工作目录失败: %v", err)
@@ -148,17 +183,23 @@ func init() {
 }
 
 // setupLogger 将日志同时输出到 stdout 和 ./logs/glean_YYYY-MM-DD.log
+// 每次（跨天）切换到新日志文件时，都会先打印一行版本号，便于确认实际运行的构建
 func setupLogger() {
 	today := nowCST().Format("2006-01-02")
 	logPath := filepath.Join(logsDir, "glean_"+today+".log")
+	if logPath == currentLogPath {
+		return // 仍是同一天的日志文件，无需重复打开
+	}
 	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
-		log.SetOutput(os.Stdout)
+		setLogOutput(os.Stdout)
 		log.Printf("警告: 无法打开日志文件 %s: %v，仅输出到控制台", logPath, err)
 		return
 	}
-	log.SetOutput(io.MultiWriter(os.Stdout, f))
+	setLogOutput(io.MultiWriter(os.Stdout, f))
+	currentLogPath = logPath
 	debugf("日志文件已就绪: %s", logPath)
+	logVersion()
 }
 
 // fetchStats 请求接口并解析需要的字段
@@ -789,14 +830,15 @@ func main() {
 	flag.Parse()
 	debugEnabled = *debugFlag
 
-	log.SetFlags(log.LstdFlags)
+	log.SetFlags(0) // 时间戳由 cstLogWriter 以东八区输出，避免 log 包使用系统本地时区
 	if *showVersion {
-		log.Printf("insigmind 统计采集 v%s", version)
+		logVersion()
 		return
 	}
-	log.Printf("启动 insigmind 统计采集 v%s", version)
+	log.Printf("启动 insigmind 统计采集")
+	logVersion()
 	debugf("调试模式已开启")
-	debugf("版本: %s", version)
+	debugf("%s: %s", versionKey, version)
 	debugf("命令行参数: once=%v report=%q week=%q month=%q year=%q debug=%v",
 		*once, *reportDay, *weekDay, *monthStr, *yearStr, *debugFlag)
 	debugf("运行时间: %s", nowCST().Format("2006-01-02 15:04:05"))

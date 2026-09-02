@@ -1,96 +1,60 @@
-name: Build and Release
+name: build
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        target:
-          - os: linux
-            arch: mipsle
-            suffix: linux_mipsle
-            goflags: CGO_ENABLED=0 GOOS=linux GOARCH=mipsle GOMIPS=softfloat
-            ldflags: "-s -w -extldflags=-static"
-            tags: "netgo osusergo"
-          - os: linux
-            arch: amd64
-            suffix: linux_amd64
-            goflags: GOOS=linux GOARCH=amd64
-            ldflags: "-s -w"
-            tags: ""
-          - os: linux
-            arch: arm64
-            suffix: linux_arm64
-            goflags: GOOS=linux GOARCH=arm64
-            ldflags: "-s -w"
-            tags: ""
-          - os: windows
-            arch: amd64
-            suffix: windows_amd64
-            goflags: GOOS=windows GOARCH=amd64
-            ldflags: "-s -w"
-            tags: ""
-
     steps:
-    - uses: actions/checkout@v4
+      - name: 检出代码
+        uses: actions/checkout@v4
 
-    - name: Set up Go
-      uses: actions/setup-go@v5
-      with:
-        go-version: '1.22'
-
-    - name: Fix go modules
-      run: |
-        go clean -modcache
-        go mod tidy
-
-    - name: Build for ${{ matrix.target.os }}/${{ matrix.target.arch }}
-      run: |
-        VERSION="v1.0.0_$(TZ=Asia/Shanghai date +%Y%m%d-%H%M)"
-        echo "Building version: $VERSION"
-        ${{ matrix.target.goflags }} go build -ldflags="${{ matrix.target.ldflags }}" ${{ matrix.target.tags != '' && format('-tags="{0}"', matrix.target.tags) || '' }} -o glean_${{ matrix.target.suffix }}.${{ matrix.target.os == 'windows' && 'exe' || '' }}
-        ls -la glean_*
-
-    - name: Upload artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: glean_${{ matrix.target.suffix }}
-        path: glean_${{ matrix.target.suffix }}.*
-
-  release:
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
+      - name: 准备 Go 环境
+        uses: actions/setup-go@v5
         with:
-          path: artifacts
-          merge-multiple: true
+          go-version: '1.21'
 
-      - name: List downloaded artifacts
-        run: ls -la artifacts/
+      # 版本号 = 构建时间（东八区），格式 YYYY-MM-DD_HH-MM-SS
+      # 注意：值中不能含空格，否则会破坏 -ldflags 的参数切分
+      - name: 生成版本号（东八区构建时间）
+        id: ver
+        run: |
+          BUILD_TIME=$(TZ=Asia/Shanghai date +'%Y-%m-%d_%H-%M-%S')
+          echo "build_time=$BUILD_TIME" >> "$GITHUB_OUTPUT"
+          echo "本次版本号(构建时间, 东八区): $BUILD_TIME"
 
-      - name: Create or Update Dev Release
+      - name: 构建 linux/mipsle（路由器插件，软浮点）
+        env:
+          CGO_ENABLED: '0'
+          GOOS: linux
+          GOARCH: mipsle
+          GOMIPS: softfloat
+        run: |
+          go build -trimpath \
+            -ldflags "-s -w -X main.version=${{ steps.ver.outputs.build_time }}" \
+            -o default.glean_linux_mipsle main.go
+
+      - name: 校验版本号已注入二进制
+        run: |
+          if grep -a -q -F "${{ steps.ver.outputs.build_time }}" default.glean_linux_mipsle; then
+            echo "已注入: ${{ steps.ver.outputs.build_time }}"
+          else
+            echo "未在二进制中找到版本号，构建中止" >&2
+            exit 1
+          fi
+
+      - name: 发布到 dev-latest
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: dev-latest
+          name: dev-latest (${{ steps.ver.outputs.build_time }})
+          body: 构建时间（东八区）：${{ steps.ver.outputs.build_time }}
+          files: default.glean_linux_mipsle
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          VERSION="dev-latest"
-          echo "使用固定版本tag: $VERSION"
-
-          gh release delete "$VERSION" --yes 2>/dev/null || true
-
-          gh release create "$VERSION" \
-            --title "Development Build (Latest)" \
-            --notes "Automatic build from commit ${{ github.sha }}%0A%0A**Platforms:**%0A- Linux amd64%0A- Linux arm64%0A- Linux mipsle (极路由2 - 已禁用CGO，静态编译)%0A- Windows amd64" \
-            --prerelease \
-            artifacts/*
