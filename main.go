@@ -431,8 +431,106 @@ func renderBarSection(w *bufio.Writer, title string, deltas map[string][2]int64,
 	fmt.Fprintf(w, "\n")
 }
 
-// renderReport 渲染通用报告并写入 ./reports
-func renderReport(title, fileName string, deltas map[string][2]int64, keys, labels []string) error {
+// dayBaselineAndEnd 定位某天的"起始基准"与"期末"两条记录：
+//   - 起始基准 = 该日 00:00 之前最后一条记录（正常情况下是前一日 23:00 的记录），
+//     因此"期末 - 基准"覆盖的正是该日 0:00 ~ 23:59 的全部增量；
+//   - 期末     = 该日最后一条记录（正常情况下是 23:00 的记录）。
+//
+// 若该日之前无任何历史数据，则退化为以该日首条记录为基准（增量自第 2 条起算）。
+func dayBaselineAndEnd(hist []record, dayStr string) (base, end record, estimated, ok bool) {
+	var lastBefore, firstOfDay *record
+	for i := range hist {
+		ts := hist[i].Timestamp
+		if len(ts) < 10 {
+			continue
+		}
+		switch d := ts[:10]; {
+		case d == dayStr:
+			if firstOfDay == nil {
+				r := hist[i]
+				firstOfDay = &r
+			}
+			end = hist[i]
+		case d < dayStr:
+			if lastBefore == nil || ts > lastBefore.Timestamp {
+				r := hist[i]
+				lastBefore = &r
+			}
+		}
+	}
+	if firstOfDay == nil {
+		return record{}, record{}, false, false
+	}
+	if lastBefore != nil {
+		base = *lastBefore
+	} else {
+		base = *firstOfDay
+		estimated = true
+	}
+	return base, end, estimated, true
+}
+
+// buildDailySummary 生成日报的"当日汇总"区块，并一并返回当日总增量
+func buildDailySummary(hist []record, dayStr string) (summary string, ds, dc int64, ok bool) {
+	base, end, estimated, ok := dayBaselineAndEnd(hist, dayStr)
+	if !ok {
+		debugf("无法计算 %s 的当日汇总: 无该日记录", dayStr)
+		return "", 0, 0, false
+	}
+	ds = end.Search - base.Search
+	dc = end.Contact - base.Contact
+	debugf("当日汇总 [%s]: 基准=%s(寻源=%d 触达=%d) 期末=%s(寻源=%d 触达=%d) 原始增量 寻源=%+d 触达=%+d (基准缺失=%v)",
+		dayStr, base.Timestamp, base.Search, base.Contact,
+		end.Timestamp, end.Search, end.Contact, ds, dc, estimated)
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "【当日汇总】(统计窗口 %s 00:00 ~ 23:59)\n", dayStr)
+	fmt.Fprintf(&b, "  起始基准 : %s  寻源=%d  触达=%d\n", base.Timestamp, base.Search, base.Contact)
+	fmt.Fprintf(&b, "  期末值   : %s  寻源=%d  触达=%d\n", end.Timestamp, end.Search, end.Contact)
+	if estimated {
+		fmt.Fprintf(&b, "  说明     : 无 %s 之前的采集数据，增量自当日首条记录起算\n", dayStr)
+	}
+	if ds < 0 || dc < 0 {
+		fmt.Fprintf(&b, "  警告     : 累计值回退(寻源 %+d, 触达 %+d)，疑似接口数据重置，增量按 0 计\n", ds, dc)
+		if ds < 0 {
+			ds = 0
+		}
+		if dc < 0 {
+			dc = 0
+		}
+	}
+	fmt.Fprintf(&b, "  当日增量 : 寻源 %+d  触达 %+d\n\n", ds, dc)
+	return b.String(), ds, dc, true
+}
+
+// sumDeltas 汇总所有桶的增量（用于周/月/年报的"本期合计"）
+func sumDeltas(deltas map[string][2]int64, keys []string) (int64, int64) {
+	var s, c int64
+	for _, k := range keys {
+		s += deltas[k][0]
+		c += deltas[k][1]
+	}
+	return s, c
+}
+
+// buildPeriodSummary 生成周/月/年报的"本期汇总"区块；avgLabel 为均值口径（日均/月均），
+// 传空字符串则不输出均值行
+func buildPeriodSummary(deltas map[string][2]int64, keys []string, avgLabel string) string {
+	s, c := sumDeltas(deltas, keys)
+	n := int64(len(keys))
+	var b strings.Builder
+	fmt.Fprintf(&b, "【本期汇总】\n")
+	fmt.Fprintf(&b, "  周期数   : %d\n", n)
+	fmt.Fprintf(&b, "  合计增量 : 寻源 %+d  触达 %+d\n", s, c)
+	if avgLabel != "" && n > 0 {
+		fmt.Fprintf(&b, "  %s增量 : 寻源 %+d  触达 %+d\n", avgLabel, s/n, c/n)
+	}
+	fmt.Fprintf(&b, "\n")
+	return b.String()
+}
+
+// renderReport 渲染通用报告并写入 ./reports；summary 为可选汇总区块（传空则不输出）
+func renderReport(title, fileName string, deltas map[string][2]int64, keys, labels []string, summary string) error {
 	var b strings.Builder
 	w := bufio.NewWriter(&b)
 	fmt.Fprintf(w, "==================================================\n")
@@ -447,6 +545,9 @@ func renderReport(title, fileName string, deltas map[string][2]int64, keys, labe
 	}
 	fmt.Fprintf(w, "覆盖周期数(有增量): %d / %d\n\n", active, len(keys))
 	debugf("渲染报告: 标题=%q 周期数=%d 有增量周期=%d", title, len(keys), active)
+	if summary != "" {
+		fmt.Fprintf(w, "%s", summary)
+	}
 
 	renderBarSection(w, "累计寻源次数", deltas, keys, labels, 0)
 	renderBarSection(w, "累计触达次数", deltas, keys, labels, 1)
@@ -495,7 +596,11 @@ func generateDailyReport(hist []record, targetDay string) error {
 		keys[h] = fmt.Sprintf("%02d", h)
 		labels[h] = fmt.Sprintf("%s %02d:00", day.Format("01-02"), h)
 	}
-	return renderReport(fmt.Sprintf("日活跃度报告  %s", dayStr), targetDay+"_report.txt", deltas, keys, labels)
+	summary, ds, dc, ok := buildDailySummary(hist, dayStr)
+	if ok {
+		log.Printf("日报 [%s] 当日总增量: 寻源 %+d, 触达 %+d", dayStr, ds, dc)
+	}
+	return renderReport(fmt.Sprintf("日活跃度报告  %s", dayStr), targetDay+"_report.txt", deltas, keys, labels, summary)
 }
 
 // generateWeeklyReport 生成 ref 所在周的周报（周一~周日，按天）
@@ -521,7 +626,7 @@ func generateWeeklyReport(hist []record, ref time.Time) error {
 	return renderReport(
 		fmt.Sprintf("周活跃度报告  %s ~ %s", startStr, endStr),
 		fmt.Sprintf("week_%s_report.txt", startStr),
-		deltas, keys, labels,
+		deltas, keys, labels, buildPeriodSummary(deltas, keys, "日均"),
 	)
 }
 
@@ -544,7 +649,7 @@ func generateMonthlyReport(hist []record, ref time.Time) error {
 	return renderReport(
 		fmt.Sprintf("月活跃度报告  %s", ym),
 		fmt.Sprintf("month_%s_report.txt", ym),
-		deltas, keys, labels,
+		deltas, keys, labels, buildPeriodSummary(deltas, keys, "日均"),
 	)
 }
 
@@ -566,7 +671,7 @@ func generateYearlyReport(hist []record, ref time.Time) error {
 	return renderReport(
 		fmt.Sprintf("年活跃度报告  %s", y),
 		fmt.Sprintf("year_%s_report.txt", y),
-		deltas, keys, labels,
+		deltas, keys, labels, buildPeriodSummary(deltas, keys, "月均"),
 	)
 }
 
