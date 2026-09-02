@@ -578,8 +578,9 @@ func buildPeriodSummary(deltas map[string][2]int64, keys []string, avgLabel stri
 	return b.String()
 }
 
-// renderReport 渲染通用报告并写入 ./reports；summary 为可选汇总区块（传空则不输出）
-func renderReport(title, fileName string, deltas map[string][2]int64, keys, labels []string, summary string) error {
+// renderReport 渲染通用报告并写入 ./reports；summary 为可选汇总区块（传空则不输出）。
+// 返回渲染出的完整报告文本，便于调用方（如启动报告）直接打印到日志
+func renderReport(title, fileName string, deltas map[string][2]int64, keys, labels []string, summary string) (string, error) {
 	var b strings.Builder
 	w := bufio.NewWriter(&b)
 	fmt.Fprintf(w, "==================================================\n")
@@ -602,22 +603,22 @@ func renderReport(title, fileName string, deltas map[string][2]int64, keys, labe
 	renderBarSection(w, "累计触达次数", deltas, keys, labels, 1)
 	w.Flush()
 
-	content := []byte(b.String())
+	content := b.String()
 	outPath := filepath.Join(reportsDir, fileName)
 	debugf("写入报告文件: %s (%d 字节)", outPath, len(content))
-	if err := os.WriteFile(outPath, content, 0644); err != nil {
+	if err := os.WriteFile(outPath, []byte(content), 0644); err != nil {
 		debugf("报告文件写入失败: %s: %v", outPath, err)
-		return err
+		return "", err
 	}
 	debugf("报告文件写入成功: %s", outPath)
-	return nil
+	return content, nil
 }
 
 // generateDailyReport 生成某天的日报（按小时）
-func generateDailyReport(hist []record, targetDay string) error {
+func generateDailyReport(hist []record, targetDay string) (string, error) {
 	day, err := parseInCST("2006-01-02", targetDay)
 	if err != nil {
-		return err
+		return "", err
 	}
 	dayStr := day.Format("2006-01-02")
 	debugf("生成日报: 目标日期=%s (星期%s)", dayStr, day.Weekday())
@@ -631,7 +632,7 @@ func generateDailyReport(hist []record, targetDay string) error {
 	}
 	if !hasData {
 		debugf("无 %s 的数据，跳过日报生成", targetDay)
-		return fmt.Errorf("无 %s 的数据", targetDay)
+		return "", fmt.Errorf("无 %s 的数据", targetDay)
 	}
 	debugf("%s 命中记录: %d 条", dayStr, dayCount)
 
@@ -653,7 +654,7 @@ func generateDailyReport(hist []record, targetDay string) error {
 }
 
 // generateWeeklyReport 生成 ref 所在周的周报（周一~周日，按天）
-func generateWeeklyReport(hist []record, ref time.Time) error {
+func generateWeeklyReport(hist []record, ref time.Time) (string, error) {
 	monday := ref.AddDate(0, 0, -int((int(ref.Weekday())+6)%7))
 	sunday := monday.AddDate(0, 0, 6)
 	startStr := monday.Format("2006-01-02")
@@ -680,7 +681,7 @@ func generateWeeklyReport(hist []record, ref time.Time) error {
 }
 
 // generateMonthlyReport 生成 ref 所在月份的月报（按天）
-func generateMonthlyReport(hist []record, ref time.Time) error {
+func generateMonthlyReport(hist []record, ref time.Time) (string, error) {
 	ym := ref.Format("2006-01")
 	debugf("生成月报: 目标月份=%s (参考日=%s)", ym, ref.Format("2006-01-02"))
 	deltas := aggByPeriod(hist, func(r record) bool {
@@ -703,7 +704,7 @@ func generateMonthlyReport(hist []record, ref time.Time) error {
 }
 
 // generateYearlyReport 生成 ref 所在年份的年报（按月）
-func generateYearlyReport(hist []record, ref time.Time) error {
+func generateYearlyReport(hist []record, ref time.Time) (string, error) {
 	y := ref.Format("2006")
 	debugf("生成年报: 目标年份=%s (参考日=%s)", y, ref.Format("2006-01-02"))
 	deltas := aggByPeriod(hist, func(r record) bool {
@@ -738,7 +739,7 @@ func autoGeneratePeriodicReports(hist []record, prevDay string) {
 		prevDay, day.Weekday(), isSunday, isMonthEnd, isYearEnd)
 
 	if isSunday {
-		if err := generateWeeklyReport(hist, day); err != nil {
+		if _, err := generateWeeklyReport(hist, day); err != nil {
 			log.Printf("生成周报失败: %v", err)
 		} else {
 			log.Printf("已生成周报: %s 所在周", prevDay)
@@ -747,7 +748,7 @@ func autoGeneratePeriodicReports(hist []record, prevDay string) {
 		debugf("非周日，不生成周报")
 	}
 	if isMonthEnd {
-		if err := generateMonthlyReport(hist, day); err != nil {
+		if _, err := generateMonthlyReport(hist, day); err != nil {
 			log.Printf("生成月报失败: %v", err)
 		} else {
 			log.Printf("已生成月报: %s", day.Format("2006-01"))
@@ -756,7 +757,7 @@ func autoGeneratePeriodicReports(hist []record, prevDay string) {
 		debugf("非月末，不生成月报")
 	}
 	if isYearEnd {
-		if err := generateYearlyReport(hist, day); err != nil {
+		if _, err := generateYearlyReport(hist, day); err != nil {
 			log.Printf("生成年报失败: %v", err)
 		} else {
 			log.Printf("已生成年报: %s", day.Format("2006"))
@@ -777,13 +778,94 @@ func generateReportsForYesterday() {
 	lastReportDay = yesterday
 	log.Printf("===== 开始生成 %s 的报告 =====", yesterday)
 	hist := loadHistory()
-	if err := generateDailyReport(hist, yesterday); err != nil {
+	if _, err := generateDailyReport(hist, yesterday); err != nil {
 		log.Printf("生成日报失败 [%s]: %v", yesterday, err)
 	} else {
 		log.Printf("已生成日报: %s", yesterday)
 	}
 	// 前一天为周日/月末/年末时，补生成周报/月报/年报
 	autoGeneratePeriodicReports(hist, yesterday)
+}
+
+// startupRefDay 确定启动报告的参考日期：
+//   - 历史中有"昨天"的数据时，以昨天为准（与每日 5:00 的自动报告口径一致）；
+//   - 否则（如设备久未联网、或程序首次运行）退化为最后一条记录所在日期，保证仍能出一份报告。
+func startupRefDay(hist []record) string {
+	yesterday := nowCST().AddDate(0, 0, -1).Format("2006-01-02")
+	for _, r := range hist {
+		if len(r.Timestamp) >= 10 && r.Timestamp[:10] == yesterday {
+			return yesterday
+		}
+	}
+	last := ""
+	for i := len(hist) - 1; i >= 0; i-- {
+		if len(hist[i].Timestamp) >= 10 {
+			last = hist[i].Timestamp[:10]
+			break
+		}
+	}
+	if last == "" {
+		return yesterday
+	}
+	debugf("启动报告: 昨天(%s)无数据，退化为最后有数据的日期 %s", yesterday, last)
+	return last
+}
+
+// printReport 将报告完整内容逐行打印到日志（同时进入控制台与当天日志文件），
+// 这样在 glean.log / logs/ 中就能直接看到报告，无需再打开 reports/ 下的文件
+func printReport(kind, content string) {
+	if content == "" {
+		return
+	}
+	log.Printf("---------- %s 开始 ----------", kind)
+	for _, line := range strings.Split(strings.TrimRight(content, "\n"), "\n") {
+		log.Printf("%s", line)
+	}
+	log.Printf("---------- %s 结束 ----------", kind)
+}
+
+// generateStartupReports 启动后一次性生成日报/周报/月报/年报各一份，
+// 文件落到 ./reports，同时把完整内容打印到日志
+func generateStartupReports() {
+	log.Printf("===== 开始生成启动报告（日报/周报/月报/年报） =====")
+	hist := loadHistory()
+	if len(hist) == 0 {
+		log.Printf("启动报告跳过: 暂无历史数据")
+		return
+	}
+
+	refStr := startupRefDay(hist)
+	ref, err := parseInCST("2006-01-02", refStr)
+	if err != nil {
+		log.Printf("启动报告跳过: 参考日期解析失败 %q: %v", refStr, err)
+		return
+	}
+	debugf("启动报告参考日期: %s (昨天=%s)", refStr, nowCST().AddDate(0, 0, -1).Format("2006-01-02"))
+
+	items := []struct {
+		kind string
+		fn   func() (string, error)
+	}{
+		{"日报", func() (string, error) { return generateDailyReport(hist, refStr) }},
+		{"周报", func() (string, error) { return generateWeeklyReport(hist, ref) }},
+		{"月报", func() (string, error) { return generateMonthlyReport(hist, ref) }},
+		{"年报", func() (string, error) { return generateYearlyReport(hist, ref) }},
+	}
+	for _, it := range items {
+		content, err := it.fn()
+		if err != nil {
+			log.Printf("生成启动%s失败: %v", it.kind, err)
+			continue
+		}
+		log.Printf("已生成启动%s (参考日 %s)", it.kind, refStr)
+		printReport(it.kind, content)
+	}
+
+	// 日报已基于 refStr 生成过，避免 5:00 时段的调度对同一天重复生成
+	if refStr == nowCST().AddDate(0, 0, -1).Format("2006-01-02") {
+		lastReportDay = refStr
+	}
+	log.Printf("===== 启动报告生成完毕 =====")
 }
 
 // runHourly 每小时对齐到整点执行一次（所有时刻判定均基于东八区）
@@ -828,6 +910,7 @@ func main() {
 	monthStr := flag.String("month", "", "手动生成指定月份的月报 (YYYY-MM)")
 	yearStr := flag.String("year", "", "手动生成指定年份的年报 (YYYY)")
 	showVersion := flag.Bool("version", false, "打印程序版本号后退出")
+	startupReport := flag.Bool("startup-report", true, "启动时立即生成日报/周报/月报/年报各一份，并打印到日志")
 	debugFlag := flag.Bool("debug", true, "开启调试日志（打印请求/响应/文件读写等详细信息）")
 	flag.Parse()
 	debugEnabled = *debugFlag
@@ -841,18 +924,20 @@ func main() {
 	logVersion()
 	debugf("调试模式已开启")
 	debugf("%s: %s", versionKey, version)
-	debugf("命令行参数: once=%v report=%q week=%q month=%q year=%q debug=%v",
-		*once, *reportDay, *weekDay, *monthStr, *yearStr, *debugFlag)
+	debugf("命令行参数: once=%v report=%q week=%q month=%q year=%q startup-report=%v debug=%v",
+		*once, *reportDay, *weekDay, *monthStr, *yearStr, *startupReport, *debugFlag)
 	debugf("运行时间: %s", nowCST().Format("2006-01-02 15:04:05"))
 	debugf("接口地址: %s", apiURL)
 
 	if *reportDay != "" {
 		debugf("模式: 手动生成日报 (%s)", *reportDay)
 		hist := loadHistory()
-		if err := generateDailyReport(hist, *reportDay); err != nil {
+		content, err := generateDailyReport(hist, *reportDay)
+		if err != nil {
 			log.Fatalf("生成报告失败: %v", err)
 		}
 		log.Printf("已生成日报: %s", *reportDay)
+		printReport("日报", content)
 		return
 	}
 
@@ -863,10 +948,12 @@ func main() {
 			log.Fatalf("日期格式错误: %v", err)
 		}
 		hist := loadHistory()
-		if err := generateWeeklyReport(hist, t); err != nil {
+		content, err := generateWeeklyReport(hist, t)
+		if err != nil {
 			log.Fatalf("生成周报失败: %v", err)
 		}
 		log.Printf("已生成周报: %s 所在周", *weekDay)
+		printReport("周报", content)
 		return
 	}
 
@@ -877,10 +964,12 @@ func main() {
 			log.Fatalf("月份格式错误: %v", err)
 		}
 		hist := loadHistory()
-		if err := generateMonthlyReport(hist, t); err != nil {
+		content, err := generateMonthlyReport(hist, t)
+		if err != nil {
 			log.Fatalf("生成月报失败: %v", err)
 		}
 		log.Printf("已生成月报: %s", *monthStr)
+		printReport("月报", content)
 		return
 	}
 
@@ -891,10 +980,12 @@ func main() {
 			log.Fatalf("年份格式错误: %v", err)
 		}
 		hist := loadHistory()
-		if err := generateYearlyReport(hist, t); err != nil {
+		content, err := generateYearlyReport(hist, t)
+		if err != nil {
 			log.Fatalf("生成年报失败: %v", err)
 		}
 		log.Printf("已生成年报: %s", *yearStr)
+		printReport("年报", content)
 		return
 	}
 
@@ -908,5 +999,11 @@ func main() {
 	// 立即执行一次，然后进入每小时循环
 	debugf("模式: 常驻运行（立即采集一次 + 每小时整点）")
 	collectOnce()
+	// 启动即出报告：日报/周报/月报/年报各一份（先采集，保证报告含最新数据）
+	if *startupReport {
+		generateStartupReports()
+	} else {
+		debugf("已通过 -startup-report=false 关闭启动报告")
+	}
 	runHourly()
 }
