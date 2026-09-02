@@ -73,6 +73,7 @@ func initChinaLoc() {
 	} else {
 		chinaLoc = time.FixedZone("CST", 8*60*60)
 	}
+	time.Local = chinaLoc
 }
 
 // nowCST 返回当前东八区时间（程序内所有"当前时间"均必须走此函数）
