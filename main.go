@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/tls"
 	"encoding/csv"
 	"encoding/json"
@@ -16,15 +17,21 @@ import (
 	"time"
 )
 
-const apiURL = "https://api.insigmind.com/Api/WebLogin/GetIndexStats"
+const (
+	// apiURL 首页统计接口（累计寻源次数 / 累计触达次数）
+	apiURL = "https://api.insigmind.com/Api/WebLogin/GetIndexStats"
+	// demandAPIURL 需求列表接口（取 data.totalCount 作为需求总量）
+	demandAPIURL = "https://api.insigmind.com/Api/WebDemand/SearchDemands"
+)
 
 // 字段中文名映射
 var fieldNames = map[string]string{
 	"searchCount":  "累计寻源次数",
 	"contactCount": "累计触达次数",
+	"totalCount":   "需求总量",
 }
 
-// API 返回结构
+// API 返回结构（首页统计）
 type apiResponse struct {
 	Success bool   `json:"success"`
 	Code    string `json:"code"`
@@ -35,11 +42,37 @@ type apiResponse struct {
 	} `json:"data"`
 }
 
+// demandRequest 需求列表接口的查询条件（固定参数，按发布时间倒序取第一页）
+type demandRequest struct {
+	PageSize             int    `json:"pageSize"`
+	Total                int    `json:"total"`
+	PageNumber           int    `json:"pageNumber"`
+	DemandUrban          string `json:"demandUrban"`
+	DemandExpirationDate string `json:"demandExpirationDate"`
+	NewDate              string `json:"newDate"`
+	SortFieldName        string `json:"sortFieldName"`
+	SortDirection        string `json:"sortDirection"`
+	DemandStatus         int    `json:"demandStatus"`
+}
+
+// demandResponse 需求列表接口返回结构（只关心 data.totalCount）
+type demandResponse struct {
+	Success bool   `json:"success"`
+	Code    string `json:"code"`
+	Message string `json:"message"`
+	Data    struct {
+		DemandList      []json.RawMessage `json:"demandList"`
+		TotalCount      int64             `json:"totalCount"`
+		AIResponseCount int64             `json:"aiResponseCount"`
+	} `json:"data"`
+}
+
 // 一条历史记录
 type record struct {
 	Timestamp string `json:"timestamp"`
 	Search    int64  `json:"searchCount"`
 	Contact   int64  `json:"contactCount"`
+	Total     int64  `json:"totalCount"` // 需求总量（本次新增，旧历史文件无此字段时解析为 0）
 }
 
 // reportHour 每天生成报告的整点小时（按东八区计）
@@ -204,15 +237,20 @@ func setupLogger() {
 	logVersion()
 }
 
-// fetchStats 请求接口并解析需要的字段
-func fetchStats() (*record, error) {
-	debugf("准备请求接口: GET %s (超时=15s, 跳过TLS校验=true)", apiURL)
-	client := &http.Client{
+// newHTTPClient 统一构造 HTTP 客户端：15s 超时 + 跳过 TLS 证书校验
+func newHTTPClient() *http.Client {
+	return &http.Client{
 		Timeout: 15 * time.Second,
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // 跳过 TLS 证书校验
 		},
 	}
+}
+
+// fetchStats 请求首页统计接口并解析累计寻源/累计触达
+func fetchStats() (*record, error) {
+	debugf("准备请求接口: GET %s (超时=15s, 跳过TLS校验=true)", apiURL)
+	client := newHTTPClient()
 	req, err := http.NewRequest("GET", apiURL, nil)
 	if err != nil {
 		debugf("构建请求失败: %v", err)
@@ -264,6 +302,69 @@ func fetchStats() (*record, error) {
 	return rec, nil
 }
 
+// fetchDemandTotal 请求需求列表接口，返回需求总量 data.totalCount
+func fetchDemandTotal() (int64, error) {
+	payload := demandRequest{
+		PageSize:             10,
+		Total:                0,
+		PageNumber:           1,
+		DemandUrban:          "",
+		DemandExpirationDate: "",
+		NewDate:              "",
+		SortFieldName:        "AuditProperties.CreateAt",
+		SortDirection:        "Descending",
+		DemandStatus:         1,
+	}
+	bodyBytes, err := json.Marshal(payload)
+	if err != nil {
+		debugf("需求接口请求体序列化失败: %v", err)
+		return 0, fmt.Errorf("序列化请求体失败: %w", err)
+	}
+	debugf("准备请求接口: POST %s (超时=15s, 跳过TLS校验=true)", demandAPIURL)
+	debugf("需求接口请求体: %s", string(bodyBytes))
+
+	client := newHTTPClient()
+	req, err := http.NewRequest("POST", demandAPIURL, bytes.NewReader(bodyBytes))
+	if err != nil {
+		debugf("构建需求接口请求失败: %v", err)
+		return 0, fmt.Errorf("构建请求失败: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "Apifox/1.0.0 (https://apifox.com)")
+
+	start := nowCST()
+	resp, err := client.Do(req)
+	elapsed := time.Since(start)
+	if err != nil {
+		debugf("需求接口请求失败 (耗时 %v): %v", elapsed, err)
+		return 0, fmt.Errorf("请求失败: %w", err)
+	}
+	defer resp.Body.Close()
+	debugf("需求接口 HTTP 响应: 状态码=%d 状态=%q 耗时=%v", resp.StatusCode, resp.Status, elapsed)
+	debugf("需求接口响应头: Content-Type=%q Content-Length=%d",
+		resp.Header.Get("Content-Type"), resp.ContentLength)
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		debugf("读取需求接口响应体失败: %v", err)
+		return 0, fmt.Errorf("读取响应失败: %w", err)
+	}
+	debugf("需求接口响应体: %d 字节, 内容=%s", len(body), truncate(strings.TrimSpace(string(body)), 1000))
+
+	var dr demandResponse
+	if err := json.Unmarshal(body, &dr); err != nil {
+		debugf("需求接口 JSON 解析失败: %v", err)
+		return 0, fmt.Errorf("解析 JSON 失败: %w", err)
+	}
+	debugf("需求接口解析结果: success=%v code=%q message=%q totalCount=%d (列表%d条, aiResponseCount=%d)",
+		dr.Success, dr.Code, dr.Message, dr.Data.TotalCount, len(dr.Data.DemandList), dr.Data.AIResponseCount)
+	if !dr.Success {
+		debugf("需求接口返回失败标记: message=%q code=%q", dr.Message, dr.Code)
+		return 0, fmt.Errorf("接口返回失败: %s", dr.Message)
+	}
+	return dr.Data.TotalCount, nil
+}
+
 // loadHistory 读取历史记录
 func loadHistory() []record {
 	debugf("读取历史文件: %s", historyFile)
@@ -280,10 +381,10 @@ func loadHistory() []record {
 	}
 	debugf("历史记录条数: %d", len(hist))
 	if len(hist) > 0 {
-		debugf("历史区间: %s ~ %s | 首条(寻源=%d, 触达=%d) | 末条(寻源=%d, 触达=%d)",
+		debugf("历史区间: %s ~ %s | 首条(寻源=%d, 触达=%d, 需求=%d) | 末条(寻源=%d, 触达=%d, 需求=%d)",
 			hist[0].Timestamp, hist[len(hist)-1].Timestamp,
-			hist[0].Search, hist[0].Contact,
-			hist[len(hist)-1].Search, hist[len(hist)-1].Contact)
+			hist[0].Search, hist[0].Contact, hist[0].Total,
+			hist[len(hist)-1].Search, hist[len(hist)-1].Contact, hist[len(hist)-1].Total)
 	}
 	return hist
 }
@@ -304,8 +405,72 @@ func saveHistory(hist []record) error {
 	return nil
 }
 
+// csvHeader CSV 列定义（新增指标时在此追加，ensureCSVHeader 会自动升级旧文件）
+var csvHeader = []string{
+	"采集时间",
+	"累计寻源次数", "当小时寻源增量",
+	"累计触达次数", "当小时触达增量",
+	"需求总量", "当小时需求增量",
+}
+
+// ensureCSVHeader 保证 CSV 表头包含全部列。
+// 旧版本写入的 CSV 缺少"需求总量"两列，这里把首行替换为新表头、并为已有行补空值，
+// 避免新写入的数据与表头列错位（文件为空或已是最新时不做任何处理）。
+func ensureCSVHeader() error {
+	f, err := os.Open(logFile)
+	if err != nil {
+		debugf("CSV 不存在，跳过表头升级: %v", err)
+		return nil
+	}
+	r := csv.NewReader(f)
+	r.FieldsPerRecord = -1 // 旧文件列数少于新表头，关闭列数一致性校验
+	rows, err := r.ReadAll()
+	f.Close()
+	if err != nil {
+		debugf("读取 CSV 失败，跳过表头升级: %v", err)
+		return nil
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+	if len(rows[0]) >= len(csvHeader) {
+		return nil // 表头已是最新
+	}
+	debugf("升级 CSV 表头: %d 列 -> %d 列, 共 %d 行", len(rows[0]), len(csvHeader), len(rows))
+	rows[0] = append([]string{}, csvHeader...)
+	for i := 1; i < len(rows); i++ {
+		for len(rows[i]) < len(csvHeader) {
+			rows[i] = append(rows[i], "")
+		}
+	}
+	out, err := os.Create(logFile)
+	if err != nil {
+		debugf("重写 CSV 失败: %v", err)
+		return err
+	}
+	w := csv.NewWriter(out)
+	if err := w.WriteAll(rows); err != nil {
+		out.Close()
+		debugf("重写 CSV 写入失败: %v", err)
+		return err
+	}
+	w.Flush()
+	if err := w.Error(); err != nil {
+		out.Close()
+		return err
+	}
+	if err := out.Close(); err != nil {
+		return err
+	}
+	debugf("CSV 表头升级完成")
+	return nil
+}
+
 // appendLog 将本次采集及与上一小时的增量写入 CSV
 func appendLog(cur record, prev *record) error {
+	if err := ensureCSVHeader(); err != nil {
+		debugf("CSV 表头升级失败: %v", err)
+	}
 	needHeader := false
 	if _, err := os.Stat(logFile); os.IsNotExist(err) {
 		needHeader = true
@@ -323,21 +488,18 @@ func appendLog(cur record, prev *record) error {
 	defer w.Flush()
 
 	if needHeader {
-		if err := w.Write([]string{
-			"采集时间",
-			"累计寻源次数", "当小时寻源增量",
-			"累计触达次数", "当小时触达增量",
-		}); err != nil {
+		if err := w.Write(csvHeader); err != nil {
 			debugf("写入 CSV 表头失败: %v", err)
 			return err
 		}
 		debugf("已写入 CSV 表头")
 	}
 
-	var searchDelta, contactDelta string
+	var searchDelta, contactDelta, totalDelta string
 	if prev != nil {
 		searchDelta = fmt.Sprintf("%d", cur.Search-prev.Search)
 		contactDelta = fmt.Sprintf("%d", cur.Contact-prev.Contact)
+		totalDelta = fmt.Sprintf("%d", cur.Total-prev.Total)
 	} else {
 		debugf("无上一条记录，增量列留空")
 	}
@@ -346,6 +508,7 @@ func appendLog(cur record, prev *record) error {
 		cur.Timestamp,
 		fmt.Sprintf("%d", cur.Search), searchDelta,
 		fmt.Sprintf("%d", cur.Contact), contactDelta,
+		fmt.Sprintf("%d", cur.Total), totalDelta,
 	}
 	debugf("CSV 行内容: %v", row)
 	if err := w.Write(row); err != nil {
@@ -371,7 +534,8 @@ func collectOnce() {
 	if len(hist) > 0 {
 		p := hist[len(hist)-1]
 		prev = &p
-		debugf("上一条记录: 时间=%s 寻源=%d 触达=%d", p.Timestamp, p.Search, p.Contact)
+		debugf("上一条记录: 时间=%s 寻源=%d 触达=%d 需求=%d",
+			p.Timestamp, p.Search, p.Contact, p.Total)
 	} else {
 		debugf("无历史记录，本次为首次采集")
 	}
@@ -383,6 +547,19 @@ func collectOnce() {
 		return
 	}
 
+	// 需求总量：单独采集，失败不致命（沿用上一次的值，增量为 0）
+	if dt, err := fetchDemandTotal(); err != nil {
+		log.Printf("采集需求总量失败: %v（本次沿用上次值）", err)
+		if prev != nil {
+			cur.Total = prev.Total
+		}
+	} else {
+		cur.Total = dt
+		if prev != nil && dt < prev.Total {
+			log.Printf("警告: 需求总量回退 %d -> %d，本次增量按 0 计", prev.Total, dt)
+		}
+	}
+
 	hist = append(hist, *cur)
 	debugf("历史记录数: %d -> %d", len(hist)-1, len(hist))
 	if err := saveHistory(hist); err != nil {
@@ -392,13 +569,15 @@ func collectOnce() {
 		log.Printf("写入日志失败: %v", err)
 	}
 
-	log.Printf("采集成功 [%s] 累计寻源=%d 累计触达=%d", cur.Timestamp, cur.Search, cur.Contact)
+	log.Printf("采集成功 [%s] 累计寻源=%d 累计触达=%d 需求总量=%d",
+		cur.Timestamp, cur.Search, cur.Contact, cur.Total)
 	if prev != nil {
 		sd := cur.Search - prev.Search
 		cd := cur.Contact - prev.Contact
-		log.Printf("  较上一小时增量: 寻源 %+d, 触达 %+d", sd, cd)
-		if sd < 0 || cd < 0 {
-			debugf("警告: 检测到负增量 (寻源=%d, 触达=%d)，可能是接口数据被重置", sd, cd)
+		td := cur.Total - prev.Total
+		log.Printf("  较上一小时增量: 寻源 %+d, 触达 %+d, 需求 %+d", sd, cd, td)
+		if sd < 0 || cd < 0 || td < 0 {
+			debugf("警告: 检测到负增量 (寻源=%d, 触达=%d, 需求=%d)，可能是接口数据被重置", sd, cd, td)
 		}
 	}
 	collectCount++
@@ -420,9 +599,13 @@ func barChart(value, max int64, width int) string {
 	return strings.Repeat("█", filled) + strings.Repeat("░", width-filled)
 }
 
-// aggByPeriod 按周期聚合增量：match 决定记录是否计入，keyFunc 决定桶（小时/日期/月份）
-func aggByPeriod(hist []record, match func(record) bool, keyFunc func(record) string) map[string][2]int64 {
-	out := make(map[string][2]int64)
+// metricCount 统计指标数量（寻源 / 触达 / 需求总量）
+const metricCount = 3
+
+// aggByPeriod 按周期聚合增量：match 决定记录是否计入，keyFunc 决定桶（小时/日期/月份）。
+// 每个桶保存三个指标的增量：[0]=寻源 [1]=触达 [2]=需求总量
+func aggByPeriod(hist []record, match func(record) bool, keyFunc func(record) string) map[string][metricCount]int64 {
+	out := make(map[string][metricCount]int64)
 	matched, clamped := 0, 0
 	debugf("开始按周期聚合: 总记录=%d 条", len(hist))
 	for i := 1; i < len(hist); i++ {
@@ -433,6 +616,11 @@ func aggByPeriod(hist []record, match func(record) bool, keyFunc func(record) st
 		matched++
 		s := r.Search - hist[i-1].Search
 		c := r.Contact - hist[i-1].Contact
+		t := r.Total - hist[i-1].Total
+		if hist[i-1].Total == 0 && r.Total > 0 {
+			// 上一条没有需求数据（旧历史文件或上次采集失败），无基准可比，增量记 0
+			t = 0
+		}
 		if s < 0 {
 			s = 0
 			clamped++
@@ -441,19 +629,24 @@ func aggByPeriod(hist []record, match func(record) bool, keyFunc func(record) st
 			c = 0
 			clamped++
 		}
+		if t < 0 {
+			t = 0
+			clamped++
+		}
 		k := keyFunc(r)
 		v := out[k]
 		v[0] += s
 		v[1] += c
+		v[2] += t
 		out[k] = v
 	}
 	debugf("聚合完成: 命中=%d 条, 负增量钳制=%d 次, 桶数=%d", matched, clamped, len(out))
 	return out
 }
 
-// renderBarSection 渲染一个指标的条形图区块（idx=0 寻源, idx=1 触达）
-func renderBarSection(w *bufio.Writer, title string, deltas map[string][2]int64, keys, labels []string, idx int) {
-	fmt.Fprintf(w, "【%s】(次)\n", title)
+// renderBarSection 渲染一个指标的条形图区块（idx=0 寻源, idx=1 触达, idx=2 需求总量）
+func renderBarSection(w *bufio.Writer, title, unit string, deltas map[string][metricCount]int64, keys, labels []string, idx int) {
+	fmt.Fprintf(w, "【%s】(%s)\n", title, unit)
 	max := int64(0)
 	hasAny := false
 	for _, k := range keys {
@@ -519,60 +712,67 @@ func dayBaselineAndEnd(hist []record, dayStr string) (base, end record, estimate
 	return base, end, estimated, true
 }
 
-// buildDailySummary 生成日报的"当日汇总"区块，并一并返回当日总增量
-func buildDailySummary(hist []record, dayStr string) (summary string, ds, dc int64, ok bool) {
+// buildDailySummary 生成日报的"当日汇总"区块，并一并返回当日总增量（寻源/触达/需求）
+func buildDailySummary(hist []record, dayStr string) (summary string, ds, dc, dt int64, ok bool) {
 	base, end, estimated, ok := dayBaselineAndEnd(hist, dayStr)
 	if !ok {
 		debugf("无法计算 %s 的当日汇总: 无该日记录", dayStr)
-		return "", 0, 0, false
+		return "", 0, 0, 0, false
 	}
 	ds = end.Search - base.Search
 	dc = end.Contact - base.Contact
-	debugf("当日汇总 [%s]: 基准=%s(寻源=%d 触达=%d) 期末=%s(寻源=%d 触达=%d) 原始增量 寻源=%+d 触达=%+d (基准缺失=%v)",
-		dayStr, base.Timestamp, base.Search, base.Contact,
-		end.Timestamp, end.Search, end.Contact, ds, dc, estimated)
+	dt = end.Total - base.Total
+	debugf("当日汇总 [%s]: 基准=%s(寻源=%d 触达=%d 需求=%d) 期末=%s(寻源=%d 触达=%d 需求=%d) 原始增量 寻源=%+d 触达=%+d 需求=%+d (基准缺失=%v)",
+		dayStr, base.Timestamp, base.Search, base.Contact, base.Total,
+		end.Timestamp, end.Search, end.Contact, end.Total, ds, dc, dt, estimated)
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "【当日汇总】(统计窗口 %s 00:00 ~ 23:59)\n", dayStr)
-	fmt.Fprintf(&b, "  起始基准 : %s  寻源=%d  触达=%d\n", base.Timestamp, base.Search, base.Contact)
-	fmt.Fprintf(&b, "  期末值   : %s  寻源=%d  触达=%d\n", end.Timestamp, end.Search, end.Contact)
+	fmt.Fprintf(&b, "  起始基准 : %s  寻源=%d  触达=%d  需求=%d\n",
+		base.Timestamp, base.Search, base.Contact, base.Total)
+	fmt.Fprintf(&b, "  期末值   : %s  寻源=%d  触达=%d  需求=%d\n",
+		end.Timestamp, end.Search, end.Contact, end.Total)
 	if estimated {
 		fmt.Fprintf(&b, "  说明     : 无 %s 之前的采集数据，增量自当日首条记录起算\n", dayStr)
 	}
-	if ds < 0 || dc < 0 {
-		fmt.Fprintf(&b, "  警告     : 累计值回退(寻源 %+d, 触达 %+d)，疑似接口数据重置，增量按 0 计\n", ds, dc)
+	if ds < 0 || dc < 0 || dt < 0 {
+		fmt.Fprintf(&b, "  警告     : 累计值回退(寻源 %+d, 触达 %+d, 需求 %+d)，疑似接口数据重置，增量按 0 计\n", ds, dc, dt)
 		if ds < 0 {
 			ds = 0
 		}
 		if dc < 0 {
 			dc = 0
 		}
+		if dt < 0 {
+			dt = 0
+		}
 	}
-	fmt.Fprintf(&b, "  当日增量 : 寻源 %+d  触达 %+d\n\n", ds, dc)
-	return b.String(), ds, dc, true
+	fmt.Fprintf(&b, "  当日增量 : 寻源 %+d  触达 %+d  需求 %+d\n\n", ds, dc, dt)
+	return b.String(), ds, dc, dt, true
 }
 
 // sumDeltas 汇总所有桶的增量（用于周/月/年报的"本期合计"）
-func sumDeltas(deltas map[string][2]int64, keys []string) (int64, int64) {
-	var s, c int64
+func sumDeltas(deltas map[string][metricCount]int64, keys []string) (int64, int64, int64) {
+	var s, c, t int64
 	for _, k := range keys {
 		s += deltas[k][0]
 		c += deltas[k][1]
+		t += deltas[k][2]
 	}
-	return s, c
+	return s, c, t
 }
 
 // buildPeriodSummary 生成周/月/年报的"本期汇总"区块；avgLabel 为均值口径（日均/月均），
 // 传空字符串则不输出均值行
-func buildPeriodSummary(deltas map[string][2]int64, keys []string, avgLabel string) string {
-	s, c := sumDeltas(deltas, keys)
+func buildPeriodSummary(deltas map[string][metricCount]int64, keys []string, avgLabel string) string {
+	s, c, t := sumDeltas(deltas, keys)
 	n := int64(len(keys))
 	var b strings.Builder
 	fmt.Fprintf(&b, "【本期汇总】\n")
 	fmt.Fprintf(&b, "  周期数   : %d\n", n)
-	fmt.Fprintf(&b, "  合计增量 : 寻源 %+d  触达 %+d\n", s, c)
+	fmt.Fprintf(&b, "  合计增量 : 寻源 %+d  触达 %+d  需求 %+d\n", s, c, t)
 	if avgLabel != "" && n > 0 {
-		fmt.Fprintf(&b, "  %s增量 : 寻源 %+d  触达 %+d\n", avgLabel, s/n, c/n)
+		fmt.Fprintf(&b, "  %s增量 : 寻源 %+d  触达 %+d  需求 %+d\n", avgLabel, s/n, c/n, t/n)
 	}
 	fmt.Fprintf(&b, "\n")
 	return b.String()
@@ -580,7 +780,7 @@ func buildPeriodSummary(deltas map[string][2]int64, keys []string, avgLabel stri
 
 // renderReport 渲染通用报告并写入 ./reports；summary 为可选汇总区块（传空则不输出）。
 // 返回渲染出的完整报告文本，便于调用方（如启动报告）直接打印到日志
-func renderReport(title, fileName string, deltas map[string][2]int64, keys, labels []string, summary string) (string, error) {
+func renderReport(title, fileName string, deltas map[string][metricCount]int64, keys, labels []string, summary string) (string, error) {
 	var b strings.Builder
 	w := bufio.NewWriter(&b)
 	fmt.Fprintf(w, "==================================================\n")
@@ -589,7 +789,7 @@ func renderReport(title, fileName string, deltas map[string][2]int64, keys, labe
 
 	active := 0
 	for _, k := range keys {
-		if deltas[k][0] > 0 || deltas[k][1] > 0 {
+		if deltas[k][0] > 0 || deltas[k][1] > 0 || deltas[k][2] > 0 {
 			active++
 		}
 	}
@@ -599,8 +799,9 @@ func renderReport(title, fileName string, deltas map[string][2]int64, keys, labe
 		fmt.Fprint(w, summary)
 	}
 
-	renderBarSection(w, "累计寻源次数", deltas, keys, labels, 0)
-	renderBarSection(w, "累计触达次数", deltas, keys, labels, 1)
+	renderBarSection(w, "累计寻源次数", "次", deltas, keys, labels, 0)
+	renderBarSection(w, "累计触达次数", "次", deltas, keys, labels, 1)
+	renderBarSection(w, "需求总量(totalCount)", "条", deltas, keys, labels, 2)
 	w.Flush()
 
 	content := b.String()
@@ -649,9 +850,9 @@ func generateDailyReport(hist []record, targetDay string) (string, error) {
 		keys[h] = fmt.Sprintf("%02d", h)
 		labels[h] = fmt.Sprintf("%s %02d:00", day.Format("01-02"), h)
 	}
-	summary, ds, dc, ok := buildDailySummary(hist, dayStr)
+	summary, ds, dc, dt, ok := buildDailySummary(hist, dayStr)
 	if ok {
-		log.Printf("日报 [%s] 当日总增量: 寻源 %+d, 触达 %+d", dayStr, ds, dc)
+		log.Printf("日报 [%s] 当日总增量: 寻源 %+d, 触达 %+d, 需求 %+d", dayStr, ds, dc, dt)
 	}
 	return renderReport(fmt.Sprintf("日活跃度报告  %s", dayStr), "daily/daily_"+targetDay+"_report.txt", deltas, keys, labels, summary)
 }
