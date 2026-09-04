@@ -644,23 +644,15 @@ func aggByPeriod(hist []record, match func(record) bool, keyFunc func(record) st
 	return out
 }
 
-// renderBarSection 渲染一个指标的条形图区块（idx=0 寻源, idx=1 触达, idx=2 需求总量）
+// renderBarSection 渲染一个指标的条形图区块（idx=0 寻源, idx=1 触达, idx=2 需求总量）。
+// 即使该指标全时段都无增量，也照常画出整条空条形图（全为 ░、数值 0），便于肉眼核对"确实没变化"。
 func renderBarSection(w *bufio.Writer, title, unit string, deltas map[string][metricCount]int64, keys, labels []string, idx int) {
 	fmt.Fprintf(w, "【%s】(%s)\n", title, unit)
 	max := int64(0)
-	hasAny := false
 	for _, k := range keys {
-		v := deltas[k][idx]
-		if v > 0 {
-			hasAny = true
-		}
-		if v > max {
+		if v := deltas[k][idx]; v > max {
 			max = v
 		}
-	}
-	if !hasAny {
-		fmt.Fprintf(w, "  该时段无增量\n\n")
-		return
 	}
 	for i, k := range keys {
 		v := deltas[k][idx]
