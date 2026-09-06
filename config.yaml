@@ -1,0 +1,12 @@
+# glean 配置文件
+# 程序启动时读取（默认工作目录下的 config.yaml，可用 -config=路径 指定其他文件）
+# 字段留空则回退到内置默认值；环境变量优先级高于本文件
+
+mail:
+  smtp_host: smtp.qq.com       # SMTP 服务器地址
+  smtp_port: 465               # 端口：465=隐式 TLS，587=STARTTLS
+  from: 768305875@qq.com       # 发件邮箱
+  auth_code: gpfruabgjebubdad  # 邮箱授权码（非登录密码）
+  to: 768305875@qq.com         # 收件邮箱，多个用 , 或 ; 分隔
+  subject_prefix: '[glean]'    # 邮件主题前缀，留空则不加前缀
+  skip_verify: true            # 是否跳过 TLS 证书校验

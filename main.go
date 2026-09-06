@@ -82,6 +82,7 @@ func parseInCST(layout, value string) (time.Time, error) {
 }
 
 var (
+	workDir       string
 	historyFile   string
 	logFile       string
 	reportsDir    string
@@ -126,6 +127,7 @@ func init() {
 		debugf("获取当前工作目录失败: %v", err)
 		dir = "."
 	}
+	workDir = dir
 	historyFile = filepath.Join(dir, "stats_history.json")
 	logFile = filepath.Join(dir, "stats_log.csv")
 	reportsDir = filepath.Join(dir, "reports")
@@ -463,6 +465,25 @@ func renderReport(title, fileName string, deltas map[string][2]int64, keys, labe
 	return nil
 }
 
+// mailReport 将已生成的报告文件作为邮件正文发送（失败只记录日志，不影响报告生成流程）
+func mailReport(name, fileName string) {
+	path := filepath.Join(reportsDir, fileName)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		debugf("读取报告文件失败，跳过邮件发送: %s: %v", path, err)
+		log.Printf("读取报告文件失败，跳过邮件发送: %v", err)
+		return
+	}
+
+	subject := loadMailConfig().WithPrefix(name)
+	debugf("准备发送报告邮件: 主题=%q 文件=%s (%d 字节)", subject, fileName, len(data))
+	if err := SendMail(subject, string(data)); err != nil {
+		log.Printf("报告邮件发送失败 [%s]: %v", fileName, err)
+		return
+	}
+	log.Printf("报告邮件已发送: %s", fileName)
+}
+
 // generateDailyReport 生成某天的日报（按小时）
 func generateDailyReport(hist []record, targetDay string) error {
 	day, err := parseInCST("2006-01-02", targetDay)
@@ -495,7 +516,11 @@ func generateDailyReport(hist []record, targetDay string) error {
 		keys[h] = fmt.Sprintf("%02d", h)
 		labels[h] = fmt.Sprintf("%s %02d:00", day.Format("01-02"), h)
 	}
-	return renderReport(fmt.Sprintf("日活跃度报告  %s", dayStr), targetDay+"_report.txt", deltas, keys, labels)
+	if err := renderReport(fmt.Sprintf("日活跃度报告  %s", dayStr), targetDay+"_report.txt", deltas, keys, labels); err != nil {
+		return err
+	}
+	mailReport(fmt.Sprintf("日报 %s", dayStr), targetDay+"_report.txt")
+	return nil
 }
 
 // generateWeeklyReport 生成 ref 所在周的周报（周一~周日，按天）
@@ -518,11 +543,12 @@ func generateWeeklyReport(hist []record, ref time.Time) error {
 		keys[i] = d.Format("2006-01-02")
 		labels[i] = d.Format("01-02") + " " + weekdayNames[i]
 	}
-	return renderReport(
-		fmt.Sprintf("周活跃度报告  %s ~ %s", startStr, endStr),
-		fmt.Sprintf("week_%s_report.txt", startStr),
-		deltas, keys, labels,
-	)
+	fileName := fmt.Sprintf("week_%s_report.txt", startStr)
+	if err := renderReport(fmt.Sprintf("周活跃度报告  %s ~ %s", startStr, endStr), fileName, deltas, keys, labels); err != nil {
+		return err
+	}
+	mailReport(fmt.Sprintf("周报 %s ~ %s", startStr, endStr), fileName)
+	return nil
 }
 
 // generateMonthlyReport 生成 ref 所在月份的月报（按天）
@@ -541,11 +567,12 @@ func generateMonthlyReport(hist []record, ref time.Time) error {
 		keys[i] = d.Format("2006-01-02")
 		labels[i] = d.Format("01-02")
 	}
-	return renderReport(
-		fmt.Sprintf("月活跃度报告  %s", ym),
-		fmt.Sprintf("month_%s_report.txt", ym),
-		deltas, keys, labels,
-	)
+	fileName := fmt.Sprintf("month_%s_report.txt", ym)
+	if err := renderReport(fmt.Sprintf("月活跃度报告  %s", ym), fileName, deltas, keys, labels); err != nil {
+		return err
+	}
+	mailReport(fmt.Sprintf("月报 %s", ym), fileName)
+	return nil
 }
 
 // generateYearlyReport 生成 ref 所在年份的年报（按月）
@@ -563,11 +590,12 @@ func generateYearlyReport(hist []record, ref time.Time) error {
 		keys[i] = d.Format("2006-01")
 		labels[i] = d.Format("2006-01")
 	}
-	return renderReport(
-		fmt.Sprintf("年活跃度报告  %s", y),
-		fmt.Sprintf("year_%s_report.txt", y),
-		deltas, keys, labels,
-	)
+	fileName := fmt.Sprintf("year_%s_report.txt", y)
+	if err := renderReport(fmt.Sprintf("年活跃度报告  %s", y), fileName, deltas, keys, labels); err != nil {
+		return err
+	}
+	mailReport(fmt.Sprintf("年报 %s", y), fileName)
+	return nil
 }
 
 // autoGeneratePeriodicReports 检测跨周/跨月/跨年，自动补生成对应报告
@@ -674,11 +702,30 @@ func main() {
 	monthStr := flag.String("month", "", "手动生成指定月份的月报 (YYYY-MM)")
 	yearStr := flag.String("year", "", "手动生成指定年份的年报 (YYYY)")
 	showVersion := flag.Bool("version", false, "打印程序版本号后退出")
+	mailTest := flag.Bool("mail", false, "发送一封测试邮件后退出（用于验证 SMTP 配置）")
+	configFile := flag.String("config", "config.yaml", "配置文件路径（默认工作目录下的 config.yaml）")
 	debugFlag := flag.Bool("debug", false, "开启调试日志（打印请求/响应/文件读写等详细信息）")
 	flag.Parse()
 	debugEnabled = *debugFlag
 
 	log.SetFlags(log.LstdFlags)
+
+	// 加载配置文件：相对路径基于工作目录；读取失败时回退到默认配置，不阻断运行
+	cfgPath := *configFile
+	if !filepath.IsAbs(cfgPath) {
+		cfgPath = filepath.Join(workDir, cfgPath)
+	}
+	cfg, cfgErr := LoadAppConfig(cfgPath)
+	appConfig = cfg
+	if cfgErr != nil {
+		log.Printf("配置提示: %v", cfgErr)
+	}
+	if debugEnabled {
+		mc := loadMailConfig()
+		debugf("邮件配置: %s:%d 发件人=%s 收件人=%s 主题前缀=%q 跳过TLS校验=%v",
+			mc.SMTPHost, mc.SMTPPort, mc.FromEmail, mc.ToEmail, mc.SubjectPrefix, mc.TLSSkipVerify)
+	}
+
 	if *showVersion {
 		log.Printf("insigmind 统计采集 v%s", version)
 		return
@@ -686,10 +733,22 @@ func main() {
 	log.Printf("启动 insigmind 统计采集 v%s", version)
 	debugf("调试模式已开启")
 	debugf("版本: %s", version)
-	debugf("命令行参数: once=%v report=%q week=%q month=%q year=%q debug=%v",
-		*once, *reportDay, *weekDay, *monthStr, *yearStr, *debugFlag)
+	debugf("命令行参数: once=%v report=%q week=%q month=%q year=%q mail=%v debug=%v",
+		*once, *reportDay, *weekDay, *monthStr, *yearStr, *mailTest, *debugFlag)
 	debugf("运行时间: %s", nowCST().Format("2006-01-02 15:04:05"))
 	debugf("接口地址: %s", apiURL)
+
+	if *mailTest {
+		debugf("模式: 发送测试邮件")
+		subject := loadMailConfig().WithPrefix(fmt.Sprintf("邮件发送测试 %s", nowCST().Format("2006-01-02 15:04")))
+		body := fmt.Sprintf("这是一封来自 glean 的测试邮件。\n\n版本：v%s\n发送时间：%s\n",
+			version, nowCST().Format("2006年01月02日 15:04:05"))
+		if err := SendMail(subject, body); err != nil {
+			log.Fatalf("发送测试邮件失败: %v", err)
+		}
+		log.Printf("测试邮件已发送")
+		return
+	}
 
 	if *reportDay != "" {
 		debugf("模式: 手动生成日报 (%s)", *reportDay)
