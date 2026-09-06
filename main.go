@@ -772,9 +772,9 @@ func buildPeriodSummary(deltas map[string][metricCount]int64, keys []string, avg
 	return b.String()
 }
 
-// renderReport 渲染通用报告并写入 ./reports；summary 为可选汇总区块（传空则不输出）。
+// renderReport 渲染通用报告并写入 ./reports/<subDir>；summary 为可选汇总区块（传空则不输出）。
 // 返回渲染出的完整报告文本，便于调用方（如启动报告）直接打印到日志
-func renderReport(title, fileName string, deltas map[string][metricCount]int64, keys, labels []string, summary string) (string, error) {
+func renderReport(subDir, title, fileName string, deltas map[string][metricCount]int64, keys, labels []string, summary string) (string, error) {
 	var b strings.Builder
 	w := bufio.NewWriter(&b)
 	fmt.Fprintf(w, "==================================================\n")
@@ -799,7 +799,7 @@ func renderReport(title, fileName string, deltas map[string][metricCount]int64, 
 	w.Flush()
 
 	content := b.String()
-	outPath := filepath.Join(reportsDir, fileName)
+	outPath := filepath.Join(reportsDir, subDir, fileName)
 	if err := os.MkdirAll(filepath.Dir(outPath), 0755); err != nil {
 		return "", fmt.Errorf("创建报告子目录失败: %w", err)
 	}
@@ -813,8 +813,8 @@ func renderReport(title, fileName string, deltas map[string][metricCount]int64, 
 }
 
 // mailReport 将已生成的报告文件作为邮件正文发送（失败只记录日志，不影响报告生成流程）
-func mailReport(name, fileName string) {
-	path := filepath.Join(reportsDir, fileName)
+func mailReport(subDir, name, fileName string) {
+	path := filepath.Join(reportsDir, subDir, fileName)
 	data, err := os.ReadFile(path)
 	if err != nil {
 		debugf("读取报告文件失败，跳过邮件发送: %s: %v", path, err)
@@ -863,10 +863,10 @@ func generateDailyReport(hist []record, targetDay string) (string, error) {
 		keys[h] = fmt.Sprintf("%02d", h)
 		labels[h] = fmt.Sprintf("%s %02d:00", day.Format("01-02"), h)
 	}
-	if _, err := renderReport(fmt.Sprintf("日活跃度报告  %s", dayStr), targetDay+"_report.txt", deltas, keys, labels, ""); err != nil {
+	if _, err := renderReport("daily", fmt.Sprintf("日活跃度报告  %s", dayStr), targetDay+"_report.txt", deltas, keys, labels, ""); err != nil {
 		return "", err
 	}
-	mailReport(fmt.Sprintf("日报 %s", dayStr), targetDay+"_report.txt")
+	mailReport("daily", fmt.Sprintf("%s 日报", dayStr), targetDay+"_report.txt")
 	return "", nil
 }
 
@@ -891,10 +891,10 @@ func generateWeeklyReport(hist []record, ref time.Time) (string, error) {
 		labels[i] = d.Format("01-02") + " " + weekdayNames[i]
 	}
 	fileName := fmt.Sprintf("week_%s_report.txt", startStr)
-	if _, err := renderReport(fmt.Sprintf("周活跃度报告  %s ~ %s", startStr, endStr), fileName, deltas, keys, labels, ""); err != nil {
+	if _, err := renderReport("week", fmt.Sprintf("周活跃度报告  %s ~ %s", startStr, endStr), fileName, deltas, keys, labels, ""); err != nil {
 		return "", err
 	}
-	mailReport(fmt.Sprintf("周报 %s ~ %s", startStr, endStr), fileName)
+	mailReport("week", fmt.Sprintf("%s ~ %s 周报", startStr, endStr), fileName)
 	return "", nil
 }
 
@@ -915,10 +915,10 @@ func generateMonthlyReport(hist []record, ref time.Time) (string, error) {
 		labels[i] = d.Format("01-02")
 	}
 	fileName := fmt.Sprintf("month_%s_report.txt", ym)
-	if _, err := renderReport(fmt.Sprintf("月活跃度报告  %s", ym), fileName, deltas, keys, labels, ""); err != nil {
+	if _, err := renderReport("month", fmt.Sprintf("月活跃度报告  %s", ym), fileName, deltas, keys, labels, ""); err != nil {
 		return "", err
 	}
-	mailReport(fmt.Sprintf("月报 %s", ym), fileName)
+	mailReport("month", fmt.Sprintf("%s 月报", ym), fileName)
 	return "", nil
 }
 
@@ -938,10 +938,10 @@ func generateYearlyReport(hist []record, ref time.Time) (string, error) {
 		labels[i] = d.Format("2006-01")
 	}
 	fileName := fmt.Sprintf("year_%s_report.txt", y)
-	if _, err := renderReport(fmt.Sprintf("年活跃度报告  %s", y), fileName, deltas, keys, labels, ""); err != nil {
+	if _, err := renderReport("year", fmt.Sprintf("年活跃度报告  %s", y), fileName, deltas, keys, labels, ""); err != nil {
 		return "", err
 	}
-	mailReport(fmt.Sprintf("年报 %s", y), fileName)
+	mailReport("year", fmt.Sprintf("%s 年报", y), fileName)
 	return "", nil
 }
 

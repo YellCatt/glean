@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -31,7 +32,8 @@ mail:
   # 收件邮箱，多个用 , 或 ; 分隔
   to: %s
   # 邮件主题前缀，最终主题形如 "[glean] 日报 2026-09-05"，留空则不加前缀
-  subject_prefix: %s
+  # 注意：用 [ ] 开头时整段必须用引号包住，否则 YAML 会当成数组导致解析失败
+  subject_prefix: '%s'
   # 是否跳过 TLS 证书校验
   skip_verify: %t
 `
@@ -51,7 +53,9 @@ func generateConfigFile(path string) error {
 
 	m := DefaultMailConfig()
 	content := fmt.Sprintf(configTemplate,
-		m.SMTPHost, m.SMTPPort, m.FromEmail, m.AuthCode, m.ToEmail, m.SubjectPrefix, m.TLSSkipVerify)
+		m.SMTPHost, m.SMTPPort, m.FromEmail, m.AuthCode, m.ToEmail,
+		// YAML 单引号字符串内的单引号需写成两个单引号
+		strings.ReplaceAll(m.SubjectPrefix, "'", "''"), m.TLSSkipVerify)
 
 	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
 		return fmt.Errorf("写入 %s 失败: %w", path, err)
@@ -77,9 +81,19 @@ func LoadAppConfig(path string) (*AppConfig, error) {
 		return DefaultAppConfig(), fmt.Errorf("配置文件不存在，已自动生成默认配置: %s", path)
 	}
 
+	// 空文件（如手动新建但没填内容）也按"没有配置"处理，直接补写一份默认配置
+	if len(strings.TrimSpace(string(data))) == 0 {
+		if genErr := generateConfigFile(path); genErr != nil {
+			return DefaultAppConfig(), fmt.Errorf("配置文件 %s 为空且补写默认配置失败，使用默认配置: %w", path, genErr)
+		}
+		return DefaultAppConfig(), fmt.Errorf("配置文件 %s 为空，已补写默认配置", path)
+	}
+
 	cfg := DefaultAppConfig()
 	if err := yaml.Unmarshal(data, cfg); err != nil {
-		return DefaultAppConfig(), fmt.Errorf("解析配置文件 %s 失败，使用默认配置: %w", path, err)
+		// 最常见的是 subject_prefix 写成 [glean]（YAML 会当成数组），这里给出针对性提示
+		return DefaultAppConfig(), fmt.Errorf("解析配置文件 %s 失败，使用默认配置: %w"+
+			"（提示：以 [ 开头的主题前缀请加引号，如 subject_prefix: '[glean]'）", path, err)
 	}
 
 	cfg.Mail.fillDefaults()
