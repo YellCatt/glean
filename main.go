@@ -863,11 +863,11 @@ func generateDailyReport(hist []record, targetDay string) (string, error) {
 		keys[h] = fmt.Sprintf("%02d", h)
 		labels[h] = fmt.Sprintf("%s %02d:00", day.Format("01-02"), h)
 	}
-	if err := renderReport(fmt.Sprintf("日活跃度报告  %s", dayStr), targetDay+"_report.txt", deltas, keys, labels); err != nil {
-		return err
+	if _, err := renderReport(fmt.Sprintf("日活跃度报告  %s", dayStr), targetDay+"_report.txt", deltas, keys, labels, ""); err != nil {
+		return "", err
 	}
 	mailReport(fmt.Sprintf("日报 %s", dayStr), targetDay+"_report.txt")
-	return nil
+	return "", nil
 }
 
 // generateWeeklyReport 生成 ref 所在周的周报（周一~周日，按天）
@@ -891,11 +891,11 @@ func generateWeeklyReport(hist []record, ref time.Time) (string, error) {
 		labels[i] = d.Format("01-02") + " " + weekdayNames[i]
 	}
 	fileName := fmt.Sprintf("week_%s_report.txt", startStr)
-	if err := renderReport(fmt.Sprintf("周活跃度报告  %s ~ %s", startStr, endStr), fileName, deltas, keys, labels); err != nil {
-		return err
+	if _, err := renderReport(fmt.Sprintf("周活跃度报告  %s ~ %s", startStr, endStr), fileName, deltas, keys, labels, ""); err != nil {
+		return "", err
 	}
 	mailReport(fmt.Sprintf("周报 %s ~ %s", startStr, endStr), fileName)
-	return nil
+	return "", nil
 }
 
 // generateMonthlyReport 生成 ref 所在月份的月报（按天）
@@ -915,11 +915,11 @@ func generateMonthlyReport(hist []record, ref time.Time) (string, error) {
 		labels[i] = d.Format("01-02")
 	}
 	fileName := fmt.Sprintf("month_%s_report.txt", ym)
-	if err := renderReport(fmt.Sprintf("月活跃度报告  %s", ym), fileName, deltas, keys, labels); err != nil {
-		return err
+	if _, err := renderReport(fmt.Sprintf("月活跃度报告  %s", ym), fileName, deltas, keys, labels, ""); err != nil {
+		return "", err
 	}
 	mailReport(fmt.Sprintf("月报 %s", ym), fileName)
-	return nil
+	return "", nil
 }
 
 // generateYearlyReport 生成 ref 所在年份的年报（按月）
@@ -938,11 +938,11 @@ func generateYearlyReport(hist []record, ref time.Time) (string, error) {
 		labels[i] = d.Format("2006-01")
 	}
 	fileName := fmt.Sprintf("year_%s_report.txt", y)
-	if err := renderReport(fmt.Sprintf("年活跃度报告  %s", y), fileName, deltas, keys, labels); err != nil {
-		return err
+	if _, err := renderReport(fmt.Sprintf("年活跃度报告  %s", y), fileName, deltas, keys, labels, ""); err != nil {
+		return "", err
 	}
 	mailReport(fmt.Sprintf("年报 %s", y), fileName)
-	return nil
+	return "", nil
 }
 
 // autoGeneratePeriodicReports 检测跨周/跨月/跨年，自动补生成对应报告
@@ -1133,6 +1133,7 @@ func main() {
 	mailTest := flag.Bool("mail", false, "发送一封测试邮件后退出（用于验证 SMTP 配置）")
 	configFile := flag.String("config", "config.yaml", "配置文件路径（默认工作目录下的 config.yaml）")
 	debugFlag := flag.Bool("debug", false, "开启调试日志（打印请求/响应/文件读写等详细信息）")
+	startupReport := flag.Bool("startup-report", true, "常驻模式启动时立即生成日报/周报/月报/年报各一份")
 	flag.Parse()
 	debugEnabled = *debugFlag
 
