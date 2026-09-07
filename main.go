@@ -863,10 +863,11 @@ func generateDailyReport(hist []record, targetDay string) (string, error) {
 		keys[h] = fmt.Sprintf("%02d", h)
 		labels[h] = fmt.Sprintf("%s %02d:00", day.Format("01-02"), h)
 	}
-	if _, err := renderReport("daily", fmt.Sprintf("日活跃度报告  %s", dayStr), targetDay+"_report.txt", deltas, keys, labels, ""); err != nil {
+	fileName := "daily_" + targetDay + "_report.txt"
+	if _, err := renderReport("daily", fmt.Sprintf("日活跃度报告  %s", dayStr), fileName, deltas, keys, labels, ""); err != nil {
 		return "", err
 	}
-	mailReport("daily", fmt.Sprintf("%s 日报", dayStr), targetDay+"_report.txt")
+	mailReport("daily", fmt.Sprintf("%s 日报", dayStr), fileName)
 	return "", nil
 }
 
