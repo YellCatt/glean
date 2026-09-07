@@ -857,11 +857,12 @@ func generateDailyReport(hist []record, targetDay string) (string, error) {
 		return len(r.Timestamp) >= 10 && r.Timestamp[:10] == dayStr
 	}, func(r record) string { return r.Timestamp[11:13] })
 
+	weekdayNames := []string{"周日", "周一", "周二", "周三", "周四", "周五", "周六"}
 	keys := make([]string, 24)
 	labels := make([]string, 24)
 	for h := 0; h < 24; h++ {
 		keys[h] = fmt.Sprintf("%02d", h)
-		labels[h] = fmt.Sprintf("%s %02d:00", day.Format("01-02"), h)
+		labels[h] = fmt.Sprintf("%s %s %02d:00", day.Format("01-02"), weekdayNames[day.Weekday()], h)
 	}
 	fileName := "daily_" + targetDay + "_report.txt"
 	if _, err := renderReport("daily", fmt.Sprintf("日活跃度报告  %s", dayStr), fileName, deltas, keys, labels, ""); err != nil {
@@ -908,12 +909,13 @@ func generateMonthlyReport(hist []record, ref time.Time) (string, error) {
 	}, func(r record) string { return r.Timestamp[:10] })
 
 	days := time.Date(ref.Year(), ref.Month()+1, 0, 0, 0, 0, 0, chinaLoc).Day()
+	weekdayNames := []string{"周日", "周一", "周二", "周三", "周四", "周五", "周六"}
 	keys := make([]string, days)
 	labels := make([]string, days)
 	for i := 0; i < days; i++ {
 		d := time.Date(ref.Year(), ref.Month(), i+1, 0, 0, 0, 0, chinaLoc)
 		keys[i] = d.Format("2006-01-02")
-		labels[i] = d.Format("01-02")
+		labels[i] = d.Format("01-02") + " " + weekdayNames[d.Weekday()]
 	}
 	fileName := fmt.Sprintf("month_%s_report.txt", ym)
 	if _, err := renderReport("month", fmt.Sprintf("月活跃度报告  %s", ym), fileName, deltas, keys, labels, ""); err != nil {
