@@ -94,9 +94,9 @@ type ReportConfig struct {
 var appConfig *AppConfig
 
 // DefaultReportConfig 内置默认报告配置：启动报告默认不发邮件、定时报告默认发邮件、默认 05:00 生成
-func DefaultReportConfig() ReportConfig {
+func DefaultReportConfig() *ReportConfig {
 	periodicMail := true
-	return ReportConfig{
+	return &ReportConfig{
 		StartupMail:  false,
 		PeriodicMail: &periodicMail,
 		Time:         &ClockTime{Hour: DefaultReportHour, Minute: 0},
@@ -183,7 +183,7 @@ report:
 
 // DefaultAppConfig 内置默认配置
 func DefaultAppConfig() *AppConfig {
-	return &AppConfig{Mail: DefaultMailConfig(), Report: DefaultReportConfig()}
+	return &AppConfig{Mail: DefaultMailConfig(), Report: *DefaultReportConfig()}
 }
 
 // generateConfigFile 生成一份带注释的默认配置文件
