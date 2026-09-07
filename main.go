@@ -75,17 +75,31 @@ type record struct {
 	Total     int64  `json:"totalCount"` // 需求总量（本次新增，旧历史文件无此字段时解析为 0）
 }
 
-// reportHour 每天生成定时报告的整点小时（东八区），取自配置 report.hour，默认 DefaultReportHour(5)。
-// 每次判定都实时读取配置，因此改配置后无需重启即可在下一小时生效。
-func reportHour() int {
+// reportClock 每天生成定时报告的时刻（东八区 时/分），取自配置 report.time，默认 05:00。
+// 每次判定都实时读取配置，因此改配置后无需重启，下一个调度点即生效。
+func reportClock() (hour, minute int) {
 	if appConfig == nil {
-		return DefaultReportHour
+		return DefaultReportHour, 0
 	}
-	h := appConfig.Report.HourValue()
-	if h < 0 || h > 23 {
-		return DefaultReportHour
+	return appConfig.Report.Clock()
+}
+
+// reportTimeText 返回 "HH:MM" 形式的报告时刻，用于启动日志
+func reportTimeText() string {
+	h, m := reportClock()
+	return fmt.Sprintf("%02d:%02d", h, m)
+}
+
+// nextReportTime 返回下一个报告触发时刻（东八区）。
+// 今天的报告时刻若已过去（含刚好等于当前时刻），则取明天同一时刻。
+func nextReportTime() time.Time {
+	h, m := reportClock()
+	now := nowCST()
+	t := time.Date(now.Year(), now.Month(), now.Day(), h, m, 0, 0, chinaLoc)
+	if !t.After(now) {
+		t = t.AddDate(0, 0, 1)
 	}
-	return h
+	return t
 }
 
 // version 程序版本号 = 构建时间（东八区 YYYY-MM-DD_HH-MM-SS），由 GitHub Actions 在构建时注入：
@@ -1245,36 +1259,46 @@ func generateStartupReports() {
 	log.Printf("===== 启动报告生成完毕 =====")
 }
 
-// runHourly 每小时对齐到整点执行一次（所有时刻判定均基于东八区）
+// runHourly 调度循环（所有时刻判定均基于东八区）：
+//   - 每个整点采集一次数据
+//   - 每天在 report.time 配置的时刻（如 05:30）生成前一天的报告
+//
+// 每一轮都重新计算"下一个整点"与"下一个报告时刻"，取较早者作为本次唤醒点，
+// 因此报告时刻可以是任意 HH:MM（不必是整点），且改配置后下一轮即生效。
 func runHourly() {
-	// 启动时刻若正处于报告时段（东八区 reportHour() 点整到该小时结束），先补生成昨日报告，避免错过
-	if nowCST().Hour() == reportHour() {
+	// 启动时刻若已过今日报告时刻且仍处于该小时内（如配置 05:30、5:45 启动），先补生成昨日报告
+	if h, _ := reportClock(); nowCST().Hour() == h {
 		generateReportsForYesterday()
 	}
 
-	// 先对齐到下一个整点
-	now := nowCST()
-	next := now.Add(time.Hour).Truncate(time.Hour)
-	wait := time.Until(next)
-	log.Printf("下次执行时间: %s", next.Format("2006-01-02 15:04:05"))
-	debugf("对齐整点: 当前=%s 下次=%s 等待=%v",
-		now.Format("2006-01-02 15:04:05"), next.Format("2006-01-02 15:04:05"), wait)
-	time.Sleep(wait)
+	rh, rm := reportClock()
+	debugf("已进入调度循环 (整点采集, 报告时点=东八区 %02d:%02d)", rh, rm)
+	for {
+		now := nowCST()
+		nextCollect := now.Add(time.Hour).Truncate(time.Hour) // 下一个整点：采集
+		nextReport := nextReportTime()                        // 下一个报告时刻：出报告
+		next := nextCollect
+		isReport := false
+		if !nextReport.After(nextCollect) {
+			// 报告时刻早于（或等于）下一整点，本次先处理报告
+			next = nextReport
+			isReport = true
+		}
+		action := "采集"
+		if isReport {
+			action = "生成报告"
+		}
+		wait := time.Until(next)
+		log.Printf("下次执行: %s（%s）", next.Format("2006-01-02 15:04:05"), action)
+		debugf("调度: 当前=%s 下次=%s 等待=%v 动作=%s",
+			now.Format("2006-01-02 15:04:05"), next.Format("2006-01-02 15:04:05"), wait, action)
+		time.Sleep(wait)
 
-	collectOnce()
-	// 对齐到整点后若恰为报告时点（如配置为 5 点、4:59 启动），补生成昨日报告
-	if nowCST().Hour() == reportHour() {
-		generateReportsForYesterday()
-	}
-	ticker := time.NewTicker(time.Hour)
-	defer ticker.Stop()
-	debugf("已进入每小时定时循环 (间隔=1h, 报告时点=东八区 %02d 点)", reportHour())
-	for t := range ticker.C {
-		tc := t.In(chinaLoc) // ticker 返回本地时间，显式转为东八区
-		debugf("定时器触发: %s", tc.Format("2006-01-02 15:04:05"))
-		collectOnce()
-		// 每天东八区 report.hour 点整，为前一天生成日报及周期报告
-		if tc.Hour() == reportHour() {
+		// 整点（含"报告时刻恰好落在整点"的情况）先采集，保证报告包含最新数据
+		if next.Minute() == 0 {
+			collectOnce()
+		}
+		if isReport {
 			generateReportsForYesterday()
 		}
 	}
@@ -1311,8 +1335,8 @@ func main() {
 		debugf("邮件配置: %s:%d 发件人=%s 收件人=%s 主题前缀=%q 跳过TLS校验=%v",
 			mc.SMTPHost, mc.SMTPPort, mc.FromEmail, mc.ToEmail, mc.SubjectPrefix, mc.TLSSkipVerify)
 	}
-	log.Printf("报告配置: 定时报告时点=东八区 %02d 点 | 定时报告发邮件=%v | 启动报告发邮件=%v",
-		reportHour(), periodicMailEnabled(), startupMailEnabled())
+	log.Printf("报告配置: 定时报告时点=东八区 %s | 定时报告发邮件=%v | 启动报告发邮件=%v",
+		reportTimeText(), periodicMailEnabled(), startupMailEnabled())
 
 	if *showVersion {
 		logVersion()

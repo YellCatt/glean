@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -15,51 +16,127 @@ type AppConfig struct {
 	Report ReportConfig `yaml:"report"`
 }
 
-// DefaultReportHour 每天生成定时报告的整点小时（东八区），配置缺失或非法时回退到此值
+// DefaultReportHour 每天生成定时报告的默认小时（东八区），配置缺失或非法时回退到此值
 const DefaultReportHour = 5
+
+// ClockTime 一天中的时刻（东八区），支持 "05:00" / "5:30" / 5 等多种写法
+type ClockTime struct {
+	Hour   int
+	Minute int
+}
+
+// String 输出 "HH:MM" 形式
+func (c ClockTime) String() string {
+	return fmt.Sprintf("%02d:%02d", c.Hour, c.Minute)
+}
+
+// UnmarshalYAML 自定义解析：既接受 "05:30" 这类字符串，也接受 5 这类整数（视为 5:00）。
+// 这样即使写成 time: 5 也不会导致整个配置文件解析失败。
+func (c *ClockTime) UnmarshalYAML(value *yaml.Node) error {
+	var s string
+	if err := value.Decode(&s); err == nil {
+		h, m, ok := parseClock(s)
+		if !ok {
+			return fmt.Errorf("无法解析时间 %q，应形如 05:30（时 0-23，分 0-59）", s)
+		}
+		c.Hour, c.Minute = h, m
+		return nil
+	}
+	var i int
+	if err := value.Decode(&i); err == nil {
+		if i < 0 || i > 23 {
+			return fmt.Errorf("小时 %d 超出范围 0-23", i)
+		}
+		c.Hour, c.Minute = i, 0
+		return nil
+	}
+	return fmt.Errorf("时间应形如 05:30（字符串）或 0-23 的整数")
+}
+
+// parseClock 解析 "HH:MM" / "H:MM" / "HH" / "H" / "HH:MM:SS"，非法返回 ok=false
+func parseClock(s string) (hour, minute int, ok bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, 0, false
+	}
+	parts := strings.Split(s, ":")
+	if len(parts) < 1 || len(parts) > 3 {
+		return 0, 0, false
+	}
+	h, err := strconv.Atoi(strings.TrimSpace(parts[0]))
+	if err != nil || h < 0 || h > 23 {
+		return 0, 0, false
+	}
+	if len(parts) == 1 {
+		return h, 0, true
+	}
+	m, err := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if err != nil || m < 0 || m > 59 {
+		return 0, 0, false
+	}
+	return h, m, true
+}
 
 // ReportConfig 报告相关配置
 type ReportConfig struct {
 	// StartupMail 启动时生成的日报/周报/月报/年报是否同时发送邮件，默认 false（只落文件与日志）
 	StartupMail bool `yaml:"startup_mail"`
-	// PeriodicMail 每天定时（report.hour 点）生成的报告是否发送邮件，默认 true。
+	// PeriodicMail 每天定时（report.time 时刻）生成的报告是否发送邮件，默认 true。
 	// 用指针是为了区分"未配置"与"显式写 false"，避免配置段为空时被误关
 	PeriodicMail *bool `yaml:"periodic_mail"`
-	// Hour 每天生成定时报告的整点小时（0-23，东八区），默认 DefaultReportHour(5)。
-	// 同样用指针：未配置时保持默认，显式 hour: 0 表示午夜 0 点生成
+	// Time 每天生成定时报告的时刻（东八区 HH:MM），默认 05:00，支持分钟（如 05:30）
+	Time *ClockTime `yaml:"time"`
+	// Hour 已废弃：旧配置的整数小时（如 hour: 5），仅在 time 未配置时兜底使用
 	Hour *int `yaml:"hour"`
 }
 
 // appConfig 全局生效的配置，在 main 解析完命令行参数后加载
 var appConfig *AppConfig
 
-// DefaultReportConfig 内置默认报告配置：启动报告默认不发邮件、定时报告默认发邮件、默认 5 点生成
+// DefaultReportConfig 内置默认报告配置：启动报告默认不发邮件、定时报告默认发邮件、默认 05:00 生成
 func DefaultReportConfig() ReportConfig {
 	periodicMail := true
-	hour := DefaultReportHour
-	return ReportConfig{StartupMail: false, PeriodicMail: &periodicMail, Hour: &hour}
+	return ReportConfig{
+		StartupMail:  false,
+		PeriodicMail: &periodicMail,
+		Time:         &ClockTime{Hour: DefaultReportHour, Minute: 0},
+	}
 }
 
-// fillDefaults 补齐未配置（或 report 段为空）的字段
+// fillDefaults 补齐未配置（或 report 段为空）的字段；兼容旧配置的 hour 字段
 func (r *ReportConfig) fillDefaults() {
 	d := DefaultReportConfig()
 	if r.PeriodicMail == nil {
 		r.PeriodicMail = d.PeriodicMail
 	}
-	if r.Hour == nil {
-		r.Hour = d.Hour
+	if r.Time == nil {
+		if r.Hour != nil && *r.Hour >= 0 && *r.Hour <= 23 {
+			r.Time = &ClockTime{Hour: *r.Hour} // 旧配置 hour: 5 等价于 05:00
+		} else {
+			r.Time = d.Time
+		}
 	}
 }
 
-// HourValue 取生效的整点小时（东八区 0-23），配置越界时回退默认值
-func (r *ReportConfig) HourValue() int {
-	if r.Hour == nil {
-		return DefaultReportHour
+// Clock 取生效的报告时刻（东八区 时/分），配置越界时回退默认值
+func (r *ReportConfig) Clock() (hour, minute int) {
+	if r.Time == nil {
+		return DefaultReportHour, 0
 	}
-	if *r.Hour < 0 || *r.Hour > 23 {
-		return DefaultReportHour
+	h, m := r.Time.Hour, r.Time.Minute
+	if h < 0 || h > 23 {
+		h, m = DefaultReportHour, 0
 	}
-	return *r.Hour
+	if m < 0 || m > 59 {
+		m = 0
+	}
+	return h, m
+}
+
+// TimeString 返回 "HH:MM" 形式的报告时刻（用于日志与配置文件模板）
+func (r *ReportConfig) TimeString() string {
+	h, m := r.Clock()
+	return fmt.Sprintf("%02d:%02d", h, m)
 }
 
 // PeriodicMailValue 取"每天定时报告是否发送邮件"，未配置时为 true
@@ -91,9 +168,10 @@ mail:
   skip_verify: %t
 
 report:
-  # 每天生成定时报告的整点小时（0-23，东八区），默认 5
-  # 例：改成 8 表示每天东八区 8:00 生成前一天的报告
-  hour: %d
+  # 每天生成定时报告的时刻（东八区 HH:MM），默认 05:00，支持分钟
+  # 例：改成 '08:30' 表示每天东八区 8:30 生成前一天的报告
+  # 旧字段 hour: 5 仍兼容（等价于 05:00），建议统一用 time
+  time: '%s'
   # 每天定时生成的报告是否发送邮件，默认 true（发送）
   # 改成 false 则只写 reports/ 文件并打印到日志，不发邮件
   periodic_mail: %t
@@ -122,7 +200,7 @@ func generateConfigFile(path string) error {
 		m.SMTPHost, m.SMTPPort, m.FromEmail, m.AuthCode, m.ToEmail,
 		// YAML 单引号字符串内的单引号需写成两个单引号
 		strings.ReplaceAll(m.SubjectPrefix, "'", "''"), m.TLSSkipVerify,
-		r.HourValue(), r.PeriodicMailValue(), r.StartupMail)
+		r.TimeString(), r.PeriodicMailValue(), r.StartupMail)
 
 	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
 		return fmt.Errorf("写入 %s 失败: %w", path, err)
