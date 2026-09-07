@@ -42,12 +42,13 @@
 
 ## 构建与运行
 ```bash
-go build -o stats.exe main.go
-stats.exe            # 常驻：立即采集一次，之后每小时整点自动采集
-stats.exe --once     # 仅采集一次后退出（适合配合系统计划任务）
-stats.exe -debug     # 开启调试日志（可与其他参数组合）
-stats.exe -version   # 打印版本号后退出
-stats.exe -config=/path/to/config.yaml  # 指定配置文件（默认工作目录下的 config.yaml）
+go build -o glean main.go
+glean                  # 常驻：立即采集一次 + 生成启动报告，之后每小时整点自动采集
+glean --once           # 仅采集一次后退出（适合配合系统计划任务）
+glean -debug           # 开启调试日志（可与其他参数组合）
+glean -version         # 打印版本号后退出
+glean -startup-report=false   # 关闭启动时自动生成日报/周报/月报/年报（默认开启）
+glean -config=/path/to/config.yaml  # 指定配置文件（默认工作目录下的 config.yaml）
 ```
 
 配置文件 `config.yaml` 用于设置邮箱等参数，详见下方「配置文件（config.yaml）」。
@@ -109,7 +110,7 @@ go build -ldflags "-X main.version=$(TZ=Asia/Shanghai date +'%Y-%m-%d_%H-%M-%S')
 > 表中所有时刻均为**东八区时间**，且该时点由配置 `report.time` 决定（默认 `05:00`，可改成任意 `HH:MM`，如 `08:30`）。
 
 四种报告生成成功后，都会**自动把报告正文发到邮箱**（读取 `reports/` 下对应文件作为正文，
-主题形如 `[glean] 日报 2026-09-05`、`[glean] 周报 2026-08-31 ~ 2026-09-06`、`[glean] 月报 2026-08`、`[glean] 年报 2026`）。
+主题由 `config.yaml` 的 `mail.subject_prefix` 决定，默认形如 `【业务监控】 日报 2026-09-05`、`【业务监控】 周报 2026-08-31 ~ 2026-09-06`、`【业务监控】 月报 2026-08`、`【业务监控】 年报 2026`）。
 邮件发送失败只记日志，不影响报告文件本身；配置与测试见下方「邮件发送」。
 
 **启动报告是否发邮件**由配置 `report.startup_mail` 控制，**默认关闭**：
@@ -119,12 +120,22 @@ go build -ldflags "-X main.version=$(TZ=Asia/Shanghai date +'%Y-%m-%d_%H-%M-%S')
 
 > 该开关只影响**启动报告**；每天 5:00 的定时报告、以及手动 `-report/-week/-month/-year` 生成的报告不受影响，仍然发送。
 
+启动报告的参考日期选定规则：
+1. 历史中存在"昨天"（东八区前一天）的采集记录时，以**昨天**为准（与每天定时报告口径一致）
+2. 若昨天无数据（设备久未联网、程序首次运行等），则**退化为历史中最后有数据的日期**，保证仍能生成一份有效的日报/周报/月报/年报
+3. 历史完全为空时跳过启动报告生成，并在日志中提示
+
+此外，若程序启动时刻刚好落在"报告小时"（由 `report.time` 决定，默认 5:00，即东八区 05:xx 启动），调度循环会在进入整点等待之前，先调用一次"每天定时报告生成"，为昨天补生成日报（以及周日/月末/年末时的周报/月报/年报）。
+
+> 启动报告**完整内容会打印到运行日志**，在控制台与当天的 `logs/glean_YYYY-MM-DD.log` 中直接可见，无需打开 `reports/` 下的文件。
+
 手动补生成（基于本地 `stats_history.json` 历史数据）：
 ```bash
-stats.exe -report=2026-09-01        # 日报
-stats.exe -week=2026-09-03          # 周报（该日期所在周）
-stats.exe -month=2026-08            # 月报
-stats.exe -year=2026                # 年报
+glean -report=2026-09-01        # 日报
+glean -week=2026-09-03          # 周报（该日期所在周）
+glean -month=2026-08            # 月报
+glean -year=2026                # 年报
+glean -mail                     # 发送一封测试邮件后退出
 ```
 
 报告示例（日报，含汇总区块）：
@@ -172,23 +183,23 @@ stats.exe -year=2026                # 年报
 ## 配置文件（config.yaml）
 启动时读取**工作目录下**的 `config.yaml`，可用 `-config` 指定其他路径（相对路径基于工作目录）：
 ```bash
-stats.exe -config /plugins/data/glean/config.yaml
+glean -config /plugins/data/glean/config.yaml
 ```
 - 文件不存在：**自动生成**一份带注释的默认 `config.yaml`（内容即内置默认值），本次运行使用默认值，日志会提示生成路径
 - 文件为空（手工新建未填内容）：同样**自动补写**默认配置
 - 字段缺失或为空：仅该字段回退到默认值
 - 读取/解析失败：整体回退到默认配置，不中断运行
 
-当前配置的 `mail` 段（邮件设置）：
+代码默认配置的 `mail` 段（首次运行自动生成的 `config.yaml` 内容）：
 ```yaml
 mail:
-  smtp_host: smtp.qq.com       # SMTP 服务器地址
-  smtp_port: 465               # 端口：465=隐式 TLS，587=STARTTLS
-  from: 768305875@qq.com       # 发件邮箱
-  auth_code: xxxxxxxx          # 邮箱授权码（非登录密码）
-  to: 768305875@qq.com         # 收件邮箱，多个用 , 或 ; 分隔
-  subject_prefix: '[glean]'    # 邮件主题前缀，留空则不加前缀
-  skip_verify: true            # 是否跳过 TLS 证书校验
+  smtp_host: smtp.qq.com          # SMTP 服务器地址
+  smtp_port: 465                  # 端口：465=隐式 TLS，587=STARTTLS
+  from: 768305875@qq.com          # 发件邮箱
+  auth_code: xxxxxxxx             # 邮箱授权码（非登录密码）
+  to: 768305875@qq.com            # 收件邮箱，多个用 , 或 ; 分隔
+  subject_prefix: '【业务监控】'    # 邮件主题前缀，留空则不加前缀
+  skip_verify: true               # 是否跳过 TLS 证书校验
 
 report:
   startup_mail: false          # 启动报告是否发送邮件，false=默认关闭（只落文件与日志）
@@ -213,8 +224,9 @@ report:
 > `time` 每轮调度都实时读取配置，改完配置文件后**下一个调度点即生效，无需重启**。
 > 手动 `-report/-week/-month/-year` 生成的报告不受 `periodic_mail` 影响，始终发送。
 
-主题由「前缀 + 报告名」组成，例如 `subject_prefix: '[glean]'` 时日报主题为 `[glean] 日报 2026-09-05`；
+主题由「前缀 + 报告名」组成，例如 `subject_prefix: '【业务监控】'` 时日报主题为 `【业务监控】 日报 2026-09-05`；
 改成 `[Insigmind 统计]`、`生产环境` 等任意文字即可，留空则主题为 `日报 2026-09-05`。
+> 注意：YAML 中以 `[` 开头的字符串必须用引号包住（如 `subject_prefix: '[glean]'`），否则会被当成数组导致解析失败；以 `【` 开头则无需引号。
 
 优先级：**环境变量 > config.yaml > 内置默认值**，环境变量用于临时覆盖：
 
@@ -245,8 +257,8 @@ SendMailWithConfig(cfg, "标题", "正文") // 使用自定义配置
 
 验证配置：
 ```bash
-stats.exe -mail            # 发送一封测试邮件后退出
-stats.exe -mail -debug     # 附带 SMTP 交互调试日志
+glean -mail            # 发送一封测试邮件后退出
+glean -mail -debug     # 附带 SMTP 交互调试日志
 ```
 
 ## 数据文件
@@ -260,24 +272,47 @@ stats.exe -mail -debug     # 附带 SMTP 交互调试日志
 - `reports/*.txt`      : 每日/周/月/年活跃度报告（按 `daily/` `week/` `month/` `year/` 分目录）
 
 ## 守护脚本部署（Linux / 路由器插件）
-`glean.sh` 为常驻守护脚本，功能：启动前清理残留进程、等待网络就绪、从 GitHub 下载/热更新二进制、进程崩溃后指数退避重启（5s→300s）、PID 防重复启动。
+`startup.sh` 为常驻守护脚本，功能：启动前清理残留进程、等待网络就绪、从 GitHub 下载/热更新二进制、进程崩溃后指数退避重启（5s→300s）、PID 防重复启动、优雅停机、下载重试。
 
 部署目录：`/plugins/data/glean`（脚本会 `cd` 到此目录，程序的数据文件均生成于此）。
 
 ```bash
-chmod +x glean.sh
-./glean.sh            # 前台运行
-nohup ./glean.sh > /dev/null 2>&1 &   # 后台运行
+chmod +x startup.sh
+./startup.sh            # 前台运行
+nohup ./startup.sh > /dev/null 2>&1 &   # 后台运行
 ```
 
-脚本内可调整的关键配置：
+脚本内可调整的关键配置（在文件顶部「配置区」）：
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `PLUGIN_DIR` | `/plugins/data/glean` | 插件与数据目录 |
-| `DOWNLOAD_URL` | `.../download/dev-latest/default.glean_linux_mipsle` | 下载地址 |
-| `UPDATE_INTERVAL` | `14400`（4 小时） | 更新检查间隔 |
+| `BINARY_NAME` | `glean` | 二进制文件名 |
+| `DOWNLOAD_URL` | `github.com/.../default.glean_linux_mipsle` | 下载地址 |
+| `UPDATE_INTERVAL` | `14400`（4 小时） | 更新检查间隔（秒） |
 | `MAX_RETRY` | `20` | 下载最大重试次数 |
+| `RESTART_DELAY` | `5` | 崩溃重启初始延迟（秒），指数退避 |
+| `MAX_RESTART_DELAY` | `300` | 崩溃重启最大延迟（秒） |
+| `CONNECT_TIMEOUT` | `120` | curl 连接超时（秒） |
+| `MAX_DOWNLOAD_TIME` | `1200` | curl 单次下载最大耗时（秒） |
+| `GRACEFUL_SHUTDOWN_TIMEOUT` | `10` | 热更新/停止时等待程序优雅退出的超时（秒） |
 
-产物：`glean.log`（脚本日志 + 程序 stdout）、`glean.pid`、`logs/`、`reports/`、`sql/`、`stats_history.json`、`sql/stats_log.csv`。
+热更新机制：
+1. 启动后立即尝试下载一次，若发现新版本则替换并重启
+2. 后续按 `UPDATE_INTERVAL` 定期检查更新
+3. 下载后用 `cmp -s` 比对文件，一致则跳过替换
+4. 替换流程：停程序 → 删旧二进制 → 重命名临时文件 → 启动新版本
 
-注意：脚本必须使用 **LF 换行**（若经 Windows 编辑需 `dos2unix glean.sh`）。
+更新记录文件 `.last_update_check`（4 字段，兼容旧格式）：
+```
+时间戳|人类可读时间戳|下次检查时间戳|下次检查人类可读时间戳
+```
+例如：`1756792345|2026-09-02 09:23:45 CST (UTC+0800)|1756806745|2026-09-02 13:23:45 CST (UTC+0800)`
+
+产物：
+- `logs/glean.log` — 脚本日志（含启动/更新/重启等守护行为）+ 程序 stdout
+- `glean.pid` — 守护脚本自身的 PID 文件，防重复启动
+- `.last_update_check` — 更新时间戳记录
+- `glean` — 主程序二进制
+- 程序自身数据文件：`logs/`、`reports/`、`sql/`、`stats_history.json`、`sql/stats_log.csv`
+
+注意：脚本必须使用 **LF 换行**（若经 Windows 编辑需 `dos2unix startup.sh`）。
