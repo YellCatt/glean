@@ -11,11 +11,64 @@ import (
 
 // AppConfig 应用配置，对应 config.yaml
 type AppConfig struct {
-	Mail MailConfig `yaml:"mail"`
+	Mail   MailConfig   `yaml:"mail"`
+	Report ReportConfig `yaml:"report"`
+}
+
+// DefaultReportHour 每天生成定时报告的整点小时（东八区），配置缺失或非法时回退到此值
+const DefaultReportHour = 5
+
+// ReportConfig 报告相关配置
+type ReportConfig struct {
+	// StartupMail 启动时生成的日报/周报/月报/年报是否同时发送邮件，默认 false（只落文件与日志）
+	StartupMail bool `yaml:"startup_mail"`
+	// PeriodicMail 每天定时（report.hour 点）生成的报告是否发送邮件，默认 true。
+	// 用指针是为了区分"未配置"与"显式写 false"，避免配置段为空时被误关
+	PeriodicMail *bool `yaml:"periodic_mail"`
+	// Hour 每天生成定时报告的整点小时（0-23，东八区），默认 DefaultReportHour(5)。
+	// 同样用指针：未配置时保持默认，显式 hour: 0 表示午夜 0 点生成
+	Hour *int `yaml:"hour"`
 }
 
 // appConfig 全局生效的配置，在 main 解析完命令行参数后加载
 var appConfig *AppConfig
+
+// DefaultReportConfig 内置默认报告配置：启动报告默认不发邮件、定时报告默认发邮件、默认 5 点生成
+func DefaultReportConfig() ReportConfig {
+	periodicMail := true
+	hour := DefaultReportHour
+	return ReportConfig{StartupMail: false, PeriodicMail: &periodicMail, Hour: &hour}
+}
+
+// fillDefaults 补齐未配置（或 report 段为空）的字段
+func (r *ReportConfig) fillDefaults() {
+	d := DefaultReportConfig()
+	if r.PeriodicMail == nil {
+		r.PeriodicMail = d.PeriodicMail
+	}
+	if r.Hour == nil {
+		r.Hour = d.Hour
+	}
+}
+
+// HourValue 取生效的整点小时（东八区 0-23），配置越界时回退默认值
+func (r *ReportConfig) HourValue() int {
+	if r.Hour == nil {
+		return DefaultReportHour
+	}
+	if *r.Hour < 0 || *r.Hour > 23 {
+		return DefaultReportHour
+	}
+	return *r.Hour
+}
+
+// PeriodicMailValue 取"每天定时报告是否发送邮件"，未配置时为 true
+func (r *ReportConfig) PeriodicMailValue() bool {
+	if r.PeriodicMail == nil {
+		return true
+	}
+	return *r.PeriodicMail
+}
 
 // configTemplate 自动生成配置文件时使用的模板，占位符由内置默认值填充
 const configTemplate = `# glean 配置文件（首次运行自动生成，可按需修改，重启后生效）
@@ -36,11 +89,23 @@ mail:
   subject_prefix: '%s'
   # 是否跳过 TLS 证书校验
   skip_verify: %t
+
+report:
+  # 每天生成定时报告的整点小时（0-23，东八区），默认 5
+  # 例：改成 8 表示每天东八区 8:00 生成前一天的报告
+  hour: %d
+  # 每天定时生成的报告是否发送邮件，默认 true（发送）
+  # 改成 false 则只写 reports/ 文件并打印到日志，不发邮件
+  periodic_mail: %t
+  # 程序启动时立即生成的日报/周报/月报/年报，是否同时发送邮件
+  # false（默认）：只写 reports/ 文件并打印到日志，不发邮件
+  # true        ：启动即发送 4 封报告邮件
+  startup_mail: %t
 `
 
 // DefaultAppConfig 内置默认配置
 func DefaultAppConfig() *AppConfig {
-	return &AppConfig{Mail: DefaultMailConfig()}
+	return &AppConfig{Mail: DefaultMailConfig(), Report: DefaultReportConfig()}
 }
 
 // generateConfigFile 生成一份带注释的默认配置文件
@@ -52,10 +117,12 @@ func generateConfigFile(path string) error {
 	}
 
 	m := DefaultMailConfig()
+	r := DefaultReportConfig()
 	content := fmt.Sprintf(configTemplate,
 		m.SMTPHost, m.SMTPPort, m.FromEmail, m.AuthCode, m.ToEmail,
 		// YAML 单引号字符串内的单引号需写成两个单引号
-		strings.ReplaceAll(m.SubjectPrefix, "'", "''"), m.TLSSkipVerify)
+		strings.ReplaceAll(m.SubjectPrefix, "'", "''"), m.TLSSkipVerify,
+		r.HourValue(), r.PeriodicMailValue(), r.StartupMail)
 
 	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
 		return fmt.Errorf("写入 %s 失败: %w", path, err)
@@ -97,5 +164,6 @@ func LoadAppConfig(path string) (*AppConfig, error) {
 	}
 
 	cfg.Mail.fillDefaults()
+	cfg.Report.fillDefaults()
 	return cfg, nil
 }

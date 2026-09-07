@@ -75,8 +75,18 @@ type record struct {
 	Total     int64  `json:"totalCount"` // 需求总量（本次新增，旧历史文件无此字段时解析为 0）
 }
 
-// reportHour 每天生成报告的整点小时（按东八区计）
-const reportHour = 5
+// reportHour 每天生成定时报告的整点小时（东八区），取自配置 report.hour，默认 DefaultReportHour(5)。
+// 每次判定都实时读取配置，因此改配置后无需重启即可在下一小时生效。
+func reportHour() int {
+	if appConfig == nil {
+		return DefaultReportHour
+	}
+	h := appConfig.Report.HourValue()
+	if h < 0 || h > 23 {
+		return DefaultReportHour
+	}
+	return h
+}
 
 // version 程序版本号 = 构建时间（东八区 YYYY-MM-DD_HH-MM-SS），由 GitHub Actions 在构建时注入：
 //
@@ -892,8 +902,33 @@ func renderReport(subDir, title, fileName string, deltas map[string][metricCount
 	return content, nil
 }
 
+// reportMailEnabled 控制"生成报告时是否顺带发送邮件"，默认开启。
+// 只有启动报告流程会在配置 report.startup_mail=false 时临时关闭它，
+// 其余路径（每天 5:00 的定时报告、手动 -report/-week/-month/-year）不受影响。
+var reportMailEnabled = true
+
+// startupMailEnabled 读取配置：启动报告是否需要发送邮件（默认 false）
+func startupMailEnabled() bool {
+	if appConfig != nil {
+		return appConfig.Report.StartupMail
+	}
+	return DefaultReportConfig().StartupMail
+}
+
+// periodicMailEnabled 读取配置：每天定时报告是否需要发送邮件（默认 true）
+func periodicMailEnabled() bool {
+	if appConfig != nil {
+		return appConfig.Report.PeriodicMailValue()
+	}
+	return DefaultReportConfig().PeriodicMailValue()
+}
+
 // mailReport 将已生成的报告文件作为邮件正文发送（失败只记录日志，不影响报告生成流程）
 func mailReport(subDir, name, fileName string) {
+	if !reportMailEnabled {
+		debugf("本次报告不发送邮件（已关闭）: %s", fileName)
+		return
+	}
 	path := filepath.Join(reportsDir, subDir, fileName)
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -1104,6 +1139,11 @@ func generateReportsForYesterday() {
 	}
 	lastReportDay = yesterday
 	log.Printf("===== 开始生成 %s 的报告 =====", yesterday)
+	// 每天定时报告是否发邮件由配置 report.periodic_mail 决定（默认 true）
+	if !periodicMailEnabled() {
+		reportMailEnabled = false
+		defer func() { reportMailEnabled = true }()
+	}
 	hist := loadHistory()
 	if _, err := generateDailyReport(hist, yesterday); err != nil {
 		log.Printf("生成日报失败 [%s]: %v", yesterday, err)
@@ -1152,13 +1192,23 @@ func printReport(kind, content string) {
 }
 
 // generateStartupReports 启动后一次性生成日报/周报/月报/年报各一份，
-// 文件落到 ./reports，同时把完整内容打印到日志
+// 文件落到 ./reports，同时把完整内容打印到日志。
+// 是否发送邮件由配置 report.startup_mail 决定（默认 false，即启动不发邮件）。
 func generateStartupReports() {
 	log.Printf("===== 开始生成启动报告（日报/周报/月报/年报） =====")
 	hist := loadHistory()
 	if len(hist) == 0 {
 		log.Printf("启动报告跳过: 暂无历史数据")
 		return
+	}
+
+	// 启动报告默认不发邮件：仅在本流程内临时关闭，结束后恢复
+	if !startupMailEnabled() {
+		reportMailEnabled = false
+		defer func() { reportMailEnabled = true }()
+		log.Printf("启动报告邮件发送: 已关闭（report.startup_mail=false），仅生成文件与日志")
+	} else {
+		log.Printf("启动报告邮件发送: 已开启（report.startup_mail=true）")
 	}
 
 	refStr := startupRefDay(hist)
@@ -1197,8 +1247,8 @@ func generateStartupReports() {
 
 // runHourly 每小时对齐到整点执行一次（所有时刻判定均基于东八区）
 func runHourly() {
-	// 启动时刻若正处于 5 点时段（东八区 5:00~5:59），先补生成昨日报告，避免错过
-	if nowCST().Hour() == reportHour {
+	// 启动时刻若正处于报告时段（东八区 reportHour() 点整到该小时结束），先补生成昨日报告，避免错过
+	if nowCST().Hour() == reportHour() {
 		generateReportsForYesterday()
 	}
 
@@ -1212,19 +1262,19 @@ func runHourly() {
 	time.Sleep(wait)
 
 	collectOnce()
-	// 对齐到整点后若恰为东八区 5 点（如 4:59 启动），补生成昨日报告
-	if nowCST().Hour() == reportHour {
+	// 对齐到整点后若恰为报告时点（如配置为 5 点、4:59 启动），补生成昨日报告
+	if nowCST().Hour() == reportHour() {
 		generateReportsForYesterday()
 	}
 	ticker := time.NewTicker(time.Hour)
 	defer ticker.Stop()
-	debugf("已进入每小时定时循环 (间隔=1h)")
+	debugf("已进入每小时定时循环 (间隔=1h, 报告时点=东八区 %02d 点)", reportHour())
 	for t := range ticker.C {
 		tc := t.In(chinaLoc) // ticker 返回本地时间，显式转为东八区
 		debugf("定时器触发: %s", tc.Format("2006-01-02 15:04:05"))
 		collectOnce()
-		// 每天早上东八区 5:00 整点，为前一天生成日报及周期报告
-		if tc.Hour() == reportHour {
+		// 每天东八区 report.hour 点整，为前一天生成日报及周期报告
+		if tc.Hour() == reportHour() {
 			generateReportsForYesterday()
 		}
 	}
@@ -1261,6 +1311,8 @@ func main() {
 		debugf("邮件配置: %s:%d 发件人=%s 收件人=%s 主题前缀=%q 跳过TLS校验=%v",
 			mc.SMTPHost, mc.SMTPPort, mc.FromEmail, mc.ToEmail, mc.SubjectPrefix, mc.TLSSkipVerify)
 	}
+	log.Printf("报告配置: 定时报告时点=东八区 %02d 点 | 定时报告发邮件=%v | 启动报告发邮件=%v",
+		reportHour(), periodicMailEnabled(), startupMailEnabled())
 
 	if *showVersion {
 		logVersion()
