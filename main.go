@@ -667,6 +667,86 @@ func renderBarSection(w *bufio.Writer, title, unit string, deltas map[string][me
 	fmt.Fprintf(w, "\n")
 }
 
+// metricNames / metricUnits 分析区块中三个指标的名称与单位（顺序与 metricCount 对应）
+var metricNames = [metricCount]string{"累计寻源次数", "累计触达次数", "需求总量"}
+
+var metricUnits = [metricCount]string{"次", "次", "条"}
+
+// joinShortLabels 把并列时段（多个桶同为最大/最小）拼成一行，超过 maxShow 个时截断并注明总数。
+// labelOf 由调用方提供"桶 key -> 报告里的简短标签"（周报用"周六"、月报用"09-05"）
+func joinShortLabels(ks []string, labelOf map[string]string) string {
+	const maxShow = 3
+	extra := ""
+	show := ks
+	if len(ks) > maxShow {
+		show = ks[:maxShow]
+		extra = fmt.Sprintf(" 等共%d个", len(ks))
+	}
+	labels := make([]string, len(show))
+	for i, k := range show {
+		if l, ok := labelOf[k]; ok {
+			labels[i] = l
+		} else {
+			labels[i] = k
+		}
+	}
+	return strings.Join(labels, " / ") + extra
+}
+
+// renderPeakAnalysis 基于周期内各时段的增量，为三个指标分别找出
+// "高峰"（增量最大的时段）与"低峰"（增量最小的时段）；并列时段全部列出，
+// 整个周期都无增量时明确提示"本期无增量"。
+//
+// keys 为参与统计的桶（小时 / 日期 / 月份），shortLabels 为与 keys 一一对应的展示标签：
+// 日报传 "19:00"（几点）、周报传 "周六"（周几）、月报传 "09-05"（具体哪天）、年报传 "2026-05"（哪月）。
+// scope 为粒度说明，会打印在区块标题中。
+func renderPeakAnalysis(deltas map[string][metricCount]int64, keys, shortLabels []string, scope string) string {
+	var b strings.Builder
+	if len(keys) == 0 {
+		return b.String()
+	}
+	labelOf := make(map[string]string, len(keys))
+	for i, k := range keys {
+		if i < len(shortLabels) {
+			labelOf[k] = shortLabels[i]
+		} else {
+			labelOf[k] = k
+		}
+	}
+	fmt.Fprintf(&b, "【高峰/低峰分析】(粒度: %s)\n", scope)
+	for idx := 0; idx < metricCount; idx++ {
+		head := fmt.Sprintf("  %s(%s) : ", metricNames[idx], metricUnits[idx])
+		firstKey := keys[0]
+		maxV := deltas[firstKey][idx]
+		maxKs := []string{firstKey}
+		minV := maxV
+		minKs := []string{firstKey}
+		for _, k := range keys[1:] {
+			v := deltas[k][idx]
+			switch {
+			case v > maxV:
+				maxV, maxKs = v, []string{k}
+			case v == maxV:
+				maxKs = append(maxKs, k)
+			}
+			switch {
+			case v < minV:
+				minV, minKs = v, []string{k}
+			case v == minV:
+				minKs = append(minKs, k)
+			}
+		}
+		if maxV == 0 {
+			fmt.Fprintf(&b, "%s本期无增量\n", head)
+			continue
+		}
+		fmt.Fprintf(&b, "%s高峰 %s (+%d) | 低峰 %s (+%d)\n",
+			head, joinShortLabels(maxKs, labelOf), maxV, joinShortLabels(minKs, labelOf), minV)
+	}
+	fmt.Fprintf(&b, "\n")
+	return b.String()
+}
+
 // dayBaselineAndEnd 定位某天的"起始基准"与"期末"两条记录：
 //   - 起始基准 = 该日 00:00 之前最后一条记录（正常情况下是前一日 23:00 的记录），
 //     因此"期末 - 基准"覆盖的正是该日 0:00 ~ 23:59 的全部增量；
@@ -860,12 +940,21 @@ func generateDailyReport(hist []record, targetDay string) (string, error) {
 	weekdayNames := []string{"周日", "周一", "周二", "周三", "周四", "周五", "周六"}
 	keys := make([]string, 24)
 	labels := make([]string, 24)
+	shortLabels := make([]string, 24) // 分析区块用的简短标签：几点
 	for h := 0; h < 24; h++ {
 		keys[h] = fmt.Sprintf("%02d", h)
 		labels[h] = fmt.Sprintf("%s %s %02d:00", day.Format("01-02"), weekdayNames[day.Weekday()], h)
+		shortLabels[h] = fmt.Sprintf("%02d:00", h)
 	}
+	// 汇总区块：当日一共新增多少 + 当天几点是高峰/低峰
+	summary := ""
+	if s, ds, dc, dt, ok := buildDailySummary(hist, dayStr); ok {
+		summary = s
+		log.Printf("日报 [%s] 当日总增量: 寻源 %+d, 触达 %+d, 需求 %+d", dayStr, ds, dc, dt)
+	}
+	summary += renderPeakAnalysis(deltas, keys, shortLabels, "按小时")
 	fileName := "daily_" + targetDay + "_report.txt"
-	if _, err := renderReport("daily", fmt.Sprintf("日活跃度报告  %s", dayStr), fileName, deltas, keys, labels, ""); err != nil {
+	if _, err := renderReport("daily", fmt.Sprintf("日活跃度报告  %s", dayStr), fileName, deltas, keys, labels, summary); err != nil {
 		return "", err
 	}
 	mailReport("daily", fmt.Sprintf("%s 日报", dayStr), fileName)
@@ -887,13 +976,18 @@ func generateWeeklyReport(hist []record, ref time.Time) (string, error) {
 	weekdayNames := []string{"周一", "周二", "周三", "周四", "周五", "周六", "周日"}
 	keys := make([]string, 7)
 	labels := make([]string, 7)
+	shortLabels := make([]string, 7) // 分析区块用的简短标签：周几
 	for i := 0; i < 7; i++ {
 		d := monday.AddDate(0, 0, i)
 		keys[i] = d.Format("2006-01-02")
 		labels[i] = d.Format("01-02") + " " + weekdayNames[i]
+		shortLabels[i] = weekdayNames[i]
 	}
+	// 汇总区块：本周合计/日均 + 周几是高峰/低峰
+	summary := buildPeriodSummary(deltas, keys, "日均") +
+		renderPeakAnalysis(deltas, keys, shortLabels, "按周几(周一~周日)")
 	fileName := fmt.Sprintf("week_%s_report.txt", startStr)
-	if _, err := renderReport("week", fmt.Sprintf("周活跃度报告  %s ~ %s", startStr, endStr), fileName, deltas, keys, labels, ""); err != nil {
+	if _, err := renderReport("week", fmt.Sprintf("周活跃度报告  %s ~ %s", startStr, endStr), fileName, deltas, keys, labels, summary); err != nil {
 		return "", err
 	}
 	mailReport("week", fmt.Sprintf("%s ~ %s 周报", startStr, endStr), fileName)
@@ -912,13 +1006,18 @@ func generateMonthlyReport(hist []record, ref time.Time) (string, error) {
 	weekdayNames := []string{"周日", "周一", "周二", "周三", "周四", "周五", "周六"}
 	keys := make([]string, days)
 	labels := make([]string, days)
+	shortLabels := make([]string, days) // 分析区块用的简短标签：具体哪一天(MM-DD)
 	for i := 0; i < days; i++ {
 		d := time.Date(ref.Year(), ref.Month(), i+1, 0, 0, 0, 0, chinaLoc)
 		keys[i] = d.Format("2006-01-02")
 		labels[i] = d.Format("01-02") + " " + weekdayNames[d.Weekday()]
+		shortLabels[i] = d.Format("01-02")
 	}
+	// 汇总区块：本月合计/日均 + 具体哪天是高峰/低峰
+	summary := buildPeriodSummary(deltas, keys, "日均") +
+		renderPeakAnalysis(deltas, keys, shortLabels, "按天(具体日期)")
 	fileName := fmt.Sprintf("month_%s_report.txt", ym)
-	if _, err := renderReport("month", fmt.Sprintf("月活跃度报告  %s", ym), fileName, deltas, keys, labels, ""); err != nil {
+	if _, err := renderReport("month", fmt.Sprintf("月活跃度报告  %s", ym), fileName, deltas, keys, labels, summary); err != nil {
 		return "", err
 	}
 	mailReport("month", fmt.Sprintf("%s 月报", ym), fileName)
@@ -935,13 +1034,18 @@ func generateYearlyReport(hist []record, ref time.Time) (string, error) {
 
 	keys := make([]string, 12)
 	labels := make([]string, 12)
+	shortLabels := make([]string, 12) // 分析区块用的简短标签：哪个月(YYYY-MM)
 	for i := 0; i < 12; i++ {
 		d := time.Date(ref.Year(), time.Month(i+1), 1, 0, 0, 0, 0, chinaLoc)
 		keys[i] = d.Format("2006-01")
 		labels[i] = d.Format("2006-01")
+		shortLabels[i] = d.Format("2006-01")
 	}
+	// 汇总区块：全年合计/月均 + 哪个月是高峰/低峰
+	summary := buildPeriodSummary(deltas, keys, "月均") +
+		renderPeakAnalysis(deltas, keys, shortLabels, "按月")
 	fileName := fmt.Sprintf("year_%s_report.txt", y)
-	if _, err := renderReport("year", fmt.Sprintf("年活跃度报告  %s", y), fileName, deltas, keys, labels, ""); err != nil {
+	if _, err := renderReport("year", fmt.Sprintf("年活跃度报告  %s", y), fileName, deltas, keys, labels, summary); err != nil {
 		return "", err
 	}
 	mailReport("year", fmt.Sprintf("%s 年报", y), fileName)
