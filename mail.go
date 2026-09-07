@@ -34,7 +34,7 @@ func DefaultMailConfig() MailConfig {
 		FromEmail:     "768305875@qq.com",
 		AuthCode:      "gpfruabgjebubdad",
 		ToEmail:       "768305875@qq.com",
-		SubjectPrefix: "业务监控",
+		SubjectPrefix: "【业务监控】",
 		TLSSkipVerify: true,
 	}
 }
