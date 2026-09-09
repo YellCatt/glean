@@ -1010,11 +1010,12 @@ func generateDailyReport(hist []record, targetDay string) (string, error) {
 	}
 	summary += renderPeakAnalysis(deltas, keys, shortLabels, "按小时")
 	fileName := "daily_" + targetDay + "_report.txt"
-	if _, err := renderReport("daily", fmt.Sprintf("日活跃度报告  %s", dayStr), fileName, deltas, keys, labels, summary); err != nil {
+	content, err := renderReport("daily", fmt.Sprintf("日活跃度报告  %s", dayStr), fileName, deltas, keys, labels, summary)
+	if err != nil {
 		return "", err
 	}
 	mailReport("daily", fmt.Sprintf("%s 日报", dayStr), fileName)
-	return "", nil
+	return content, nil
 }
 
 // generateWeeklyReport 生成 ref 所在周的周报（周一~周日，按天）
@@ -1043,11 +1044,12 @@ func generateWeeklyReport(hist []record, ref time.Time) (string, error) {
 	summary := buildPeriodSummary(deltas, keys, "日均") +
 		renderPeakAnalysis(deltas, keys, shortLabels, "按周几(周一~周日)")
 	fileName := fmt.Sprintf("week_%s_report.txt", startStr)
-	if _, err := renderReport("week", fmt.Sprintf("周活跃度报告  %s ~ %s", startStr, endStr), fileName, deltas, keys, labels, summary); err != nil {
+	content, err := renderReport("week", fmt.Sprintf("周活跃度报告  %s ~ %s", startStr, endStr), fileName, deltas, keys, labels, summary)
+	if err != nil {
 		return "", err
 	}
 	mailReport("week", fmt.Sprintf("%s ~ %s 周报", startStr, endStr), fileName)
-	return "", nil
+	return content, nil
 }
 
 // generateMonthlyReport 生成 ref 所在月份的月报（按天）
@@ -1073,11 +1075,12 @@ func generateMonthlyReport(hist []record, ref time.Time) (string, error) {
 	summary := buildPeriodSummary(deltas, keys, "日均") +
 		renderPeakAnalysis(deltas, keys, shortLabels, "按天(具体日期)")
 	fileName := fmt.Sprintf("month_%s_report.txt", ym)
-	if _, err := renderReport("month", fmt.Sprintf("月活跃度报告  %s", ym), fileName, deltas, keys, labels, summary); err != nil {
+	content, err := renderReport("month", fmt.Sprintf("月活跃度报告  %s", ym), fileName, deltas, keys, labels, summary)
+	if err != nil {
 		return "", err
 	}
 	mailReport("month", fmt.Sprintf("%s 月报", ym), fileName)
-	return "", nil
+	return content, nil
 }
 
 // generateYearlyReport 生成 ref 所在年份的年报（按月）
@@ -1101,11 +1104,12 @@ func generateYearlyReport(hist []record, ref time.Time) (string, error) {
 	summary := buildPeriodSummary(deltas, keys, "月均") +
 		renderPeakAnalysis(deltas, keys, shortLabels, "按月")
 	fileName := fmt.Sprintf("year_%s_report.txt", y)
-	if _, err := renderReport("year", fmt.Sprintf("年活跃度报告  %s", y), fileName, deltas, keys, labels, summary); err != nil {
+	content, err := renderReport("year", fmt.Sprintf("年活跃度报告  %s", y), fileName, deltas, keys, labels, summary)
+	if err != nil {
 		return "", err
 	}
 	mailReport("year", fmt.Sprintf("%s 年报", y), fileName)
-	return "", nil
+	return content, nil
 }
 
 // generateReportFile 生成一份报告；mail 为 false 时只更新 reports/ 下的文件、不发送邮件。
@@ -1215,11 +1219,11 @@ func printReport(kind, content string) {
 	log.Printf("---------- %s 结束 ----------", kind)
 }
 
-// generateStartupReports 启动后一次性生成日报/周报/月报/年报各一份，
+// generateStartupReports 启动后一次性刷新日报/周报/月报/年报各一份，
 // 文件落到 ./reports，同时把完整内容打印到日志。
-// 是否发送邮件由配置 report.startup_mail 决定（默认 false，即启动不发邮件）。
+// 是否发送邮件由配置 report.startup_mail 决定（默认 false，即启动只更新文件、不发邮件）。
 func generateStartupReports() {
-	log.Printf("===== 开始生成启动报告（日报/周报/月报/年报） =====")
+	log.Printf("===== 开始更新启动报告（日报/周报/月报/年报，仅更新文件） =====")
 	hist := loadHistory()
 	if len(hist) == 0 {
 		log.Printf("启动报告跳过: 暂无历史数据")
@@ -1252,14 +1256,24 @@ func generateStartupReports() {
 		{"月报", func() (string, error) { return generateMonthlyReport(hist, ref) }},
 		{"年报", func() (string, error) { return generateYearlyReport(hist, ref) }},
 	}
+	var done, failed []string
 	for _, it := range items {
 		content, err := it.fn()
 		if err != nil {
 			log.Printf("生成启动%s失败: %v", it.kind, err)
+			failed = append(failed, it.kind)
 			continue
 		}
-		log.Printf("已生成启动%s (参考日 %s)", it.kind, refStr)
+		log.Printf("已更新启动%s文件 (参考日 %s)", it.kind, refStr)
+		done = append(done, it.kind)
 		printReport(it.kind, content)
+	}
+	if len(done) > 0 {
+		log.Printf("启动报告已更新 %d/%d 个: %s（写入 %s）",
+			len(done), len(items), strings.Join(done, " / "), reportsDir)
+	}
+	if len(failed) > 0 {
+		log.Printf("启动报告未生成: %s", strings.Join(failed, " / "))
 	}
 
 	// 日报已基于 refStr 生成过，避免 5:00 时段的调度对同一天重复生成
