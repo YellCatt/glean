@@ -1108,8 +1108,28 @@ func generateYearlyReport(hist []record, ref time.Time) (string, error) {
 	return "", nil
 }
 
-// autoGeneratePeriodicReports 检测跨周/跨月/跨年，自动补生成对应报告
-func autoGeneratePeriodicReports(hist []record, prevDay string) {
+// generateReportFile 生成一份报告；mail 为 false 时只更新 reports/ 下的文件、不发送邮件。
+// 通过临时关闭 reportMailEnabled 实现，结束后恢复（保持单线程调用，无并发问题）。
+func generateReportFile(mail bool, generate func() (string, error), kind, ref string) {
+	if !mail && reportMailEnabled {
+		reportMailEnabled = false
+		defer func() { reportMailEnabled = true }()
+	}
+	if _, err := generate(); err != nil {
+		log.Printf("生成%s失败: %v", kind, err)
+		return
+	}
+	if mail {
+		log.Printf("已生成%s并发送邮件: %s", kind, ref)
+	} else {
+		log.Printf("已更新%s文件: %s（本次不发邮件）", kind, ref)
+	}
+}
+
+// refreshPeriodicReports 每天刷新周报/月报/年报的**文件**（滚动到最新数据），
+// 但只在周期结束日发送邮件：周日发周报、月末发月报、年末发年报。
+// 这样 reports/ 下四类报告每天都是最新的，而邮箱里每天只收到日报。
+func refreshPeriodicReports(hist []record, prevDay string) {
 	day, err := parseInCST("2006-01-02", prevDay)
 	if err != nil {
 		debugf("周期检测跳过: 日期解析失败 %q: %v", prevDay, err)
@@ -1121,37 +1141,20 @@ func autoGeneratePeriodicReports(hist []record, prevDay string) {
 	debugf("周期检测 [%s]: 星期%s | 是否周末=%v 是否月末=%v 是否年末=%v",
 		prevDay, day.Weekday(), isSunday, isMonthEnd, isYearEnd)
 
-	if isSunday {
-		if _, err := generateWeeklyReport(hist, day); err != nil {
-			log.Printf("生成周报失败: %v", err)
-		} else {
-			log.Printf("已生成周报: %s 所在周", prevDay)
-		}
-	} else {
-		debugf("非周日，不生成周报")
-	}
-	if isMonthEnd {
-		if _, err := generateMonthlyReport(hist, day); err != nil {
-			log.Printf("生成月报失败: %v", err)
-		} else {
-			log.Printf("已生成月报: %s", day.Format("2006-01"))
-		}
-	} else {
-		debugf("非月末，不生成月报")
-	}
-	if isYearEnd {
-		if _, err := generateYearlyReport(hist, day); err != nil {
-			log.Printf("生成年报失败: %v", err)
-		} else {
-			log.Printf("已生成年报: %s", day.Format("2006"))
-		}
-	} else {
-		debugf("非年末，不生成年报")
-	}
+	// 周报：每天更新"昨天所在周"的文件，周日时发送邮件
+	generateReportFile(isSunday, func() (string, error) { return generateWeeklyReport(hist, day) },
+		"周报", fmt.Sprintf("%s 所在周", prevDay))
+	// 月报：每天更新"昨天所在月"的文件，月末时发送邮件
+	generateReportFile(isMonthEnd, func() (string, error) { return generateMonthlyReport(hist, day) },
+		"月报", day.Format("2006-01"))
+	// 年报：每天更新"昨天所在年"的文件，年末时发送邮件
+	generateReportFile(isYearEnd, func() (string, error) { return generateYearlyReport(hist, day) },
+		"年报", day.Format("2006"))
 }
 
-// generateReportsForYesterday 为"昨天"生成日报；若昨天为周日/月末/年末，
-// 则同时补生成周报/月报/年报（每天早上 5:00 调用）
+// generateReportsForYesterday 为"昨天"生成日报，并同时刷新周报/月报/年报的文件
+// （日报每天发邮件；周/月/年报只更新文件，到周日/月末/年末才发邮件）。
+// 由每天 report.time 时刻的调度调用。
 func generateReportsForYesterday() {
 	yesterday := nowCST().AddDate(0, 0, -1).Format("2006-01-02")
 	if lastReportDay == yesterday {
@@ -1171,8 +1174,8 @@ func generateReportsForYesterday() {
 	} else {
 		log.Printf("已生成日报: %s", yesterday)
 	}
-	// 前一天为周日/月末/年末时，补生成周报/月报/年报
-	autoGeneratePeriodicReports(hist, yesterday)
+	// 周报/月报/年报：每天都刷新文件，邮件只在周期结束日发
+	refreshPeriodicReports(hist, yesterday)
 }
 
 // startupRefDay 确定启动报告的参考日期：
