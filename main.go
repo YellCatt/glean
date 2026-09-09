@@ -610,12 +610,15 @@ func collectOnce() {
 	debugf("本次采集总耗时: %v", time.Since(start))
 }
 
-// barChart 生成条形图：value 相对 max 按比例填充 █，其余用 ░
 func barChart(value, max int64, width int) string {
+	absV := value
+	if absV < 0 {
+		absV = -absV
+	}
 	filled := 0
 	if max > 0 {
-		filled = int(float64(value) / float64(max) * float64(width))
-		if value > 0 && filled == 0 {
+		filled = int(float64(absV) / float64(max) * float64(width))
+		if absV > 0 && filled == 0 {
 			filled = 1
 		}
 	}
@@ -655,10 +658,6 @@ func aggByPeriod(hist []record, match func(record) bool, keyFunc func(record) st
 			c = 0
 			clamped++
 		}
-		if t < 0 {
-			t = 0
-			clamped++
-		}
 		k := keyFunc(r)
 		v := out[k]
 		v[0] += s
@@ -670,20 +669,28 @@ func aggByPeriod(hist []record, match func(record) bool, keyFunc func(record) st
 	return out
 }
 
-// renderBarSection 渲染一个指标的条形图区块（idx=0 寻源, idx=1 触达, idx=2 需求总量）。
-// 即使该指标全时段都无增量，也照常画出整条空条形图（全为 ░、数值 0），便于肉眼核对"确实没变化"。
 func renderBarSection(w *bufio.Writer, title, unit string, deltas map[string][metricCount]int64, keys, labels []string, idx int) {
 	fmt.Fprintf(w, "【%s】(%s)\n", title, unit)
 	max := int64(0)
 	for _, k := range keys {
-		if v := deltas[k][idx]; v > max {
-			max = v
+		if v := deltas[k][idx]; v != 0 {
+			absV := v
+			if absV < 0 {
+				absV = -absV
+			}
+			if absV > max {
+				max = absV
+			}
 		}
 	}
 	for i, k := range keys {
 		v := deltas[k][idx]
 		flag := ""
-		if v > 0 && v == max {
+		absV := v
+		if absV < 0 {
+			absV = -absV
+		}
+		if absV > 0 && absV == max {
 			flag = " ⚠️"
 		}
 		fmt.Fprintf(w, "  %s %s %10d%s\n", labels[i], barChart(v, max, 20), v, flag)
