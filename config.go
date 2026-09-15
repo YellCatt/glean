@@ -14,6 +14,38 @@ import (
 type AppConfig struct {
 	Mail   MailConfig   `yaml:"mail"`
 	Report ReportConfig `yaml:"report"`
+	Alert  AlertConfig  `yaml:"alert"`
+}
+
+// AlertConfig 接口告警相关配置
+type AlertConfig struct {
+	// Enabled 告警开关，默认 true（开启）
+	Enabled bool `yaml:"enabled"`
+	// Consecutive404Threshold 连续多少次 HTTP 404 后触发告警，默认 48（两天 × 每天 24 次）
+	Consecutive404Threshold int `yaml:"consecutive_404_threshold"`
+	// NotifyRecovery 告警后接口恢复正常时是否发一封恢复邮件，默认 true
+	NotifyRecovery bool `yaml:"notify_recovery"`
+}
+
+// DefaultAlertConfig 内置默认告警配置
+func DefaultAlertConfig() *AlertConfig {
+	return &AlertConfig{
+		Enabled:                 true,
+		Consecutive404Threshold: 48,
+		NotifyRecovery:          true,
+	}
+}
+
+// fillDefaults 补齐未配置的字段
+func (a *AlertConfig) fillDefaults() {
+	d := DefaultAlertConfig()
+	if !a.Enabled && d.Enabled {
+		// Enabled 是 bool，零值 false 无法区分"未配置"和"显式 false"，
+		// 这里保持用户显式 false 的意图，不覆盖
+	}
+	if a.Consecutive404Threshold == 0 {
+		a.Consecutive404Threshold = d.Consecutive404Threshold
+	}
 }
 
 // DefaultReportHour 每天生成定时报告的默认小时（东八区），配置缺失或非法时回退到此值
@@ -179,11 +211,20 @@ report:
   # false（默认）：只写 reports/ 文件并打印到日志，不发邮件
   # true        ：启动即发送 4 封报告邮件
   startup_mail: %t
+
+alert:
+  # 接口告警开关，默认 true（开启）
+  enabled: %t
+  # 连续多少次 HTTP 404 后触发告警邮件，默认 %d 次（两天 × 每天 24 次 = 约 2 天）
+  # 改成 24 则变成"连续一天 404 就告警"，改成 96 则变成"连续 4 天"
+  consecutive_404_threshold: %d
+  # 告警后接口恢复正常时，是否再发一封恢复通知邮件，默认 true
+  notify_recovery: %t
 `
 
 // DefaultAppConfig 内置默认配置
 func DefaultAppConfig() *AppConfig {
-	return &AppConfig{Mail: DefaultMailConfig(), Report: *DefaultReportConfig()}
+	return &AppConfig{Mail: DefaultMailConfig(), Report: *DefaultReportConfig(), Alert: *DefaultAlertConfig()}
 }
 
 // generateConfigFile 生成一份带注释的默认配置文件
@@ -196,11 +237,13 @@ func generateConfigFile(path string) error {
 
 	m := DefaultMailConfig()
 	r := DefaultReportConfig()
+	a := DefaultAlertConfig()
 	content := fmt.Sprintf(configTemplate,
 		m.SMTPHost, m.SMTPPort, m.FromEmail, m.AuthCode, m.ToEmail,
 		// YAML 单引号字符串内的单引号需写成两个单引号
 		strings.ReplaceAll(m.SubjectPrefix, "'", "''"), m.TLSSkipVerify,
-		r.TimeString(), r.PeriodicMailValue(), r.StartupMail)
+		r.TimeString(), r.PeriodicMailValue(), r.StartupMail,
+		a.Enabled, a.Consecutive404Threshold, a.Consecutive404Threshold, a.NotifyRecovery)
 
 	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
 		return fmt.Errorf("写入 %s 失败: %w", path, err)
@@ -243,5 +286,6 @@ func LoadAppConfig(path string) (*AppConfig, error) {
 
 	cfg.Mail.fillDefaults()
 	cfg.Report.fillDefaults()
+	cfg.Alert.fillDefaults()
 	return cfg, nil
 }

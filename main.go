@@ -240,6 +240,7 @@ func init() {
 	}
 	debugf("路径配置: 历史=%s | CSV=%s | 报告目录=%s | 日志目录=%s | 数据目录=%s",
 		historyFile, logFile, reportsDir, logsDir, sqlDir)
+	initAlertState()
 	setupLogger()
 }
 
@@ -274,13 +275,14 @@ func newHTTPClient() *http.Client {
 }
 
 // fetchStats 请求首页统计接口并解析累计寻源/累计触达
-func fetchStats() (*record, error) {
+// 返回：记录对象、HTTP 状态码（0 表示请求根本没发出去）、error
+func fetchStats() (*record, int, error) {
 	debugf("准备请求接口: GET %s (超时=15s, 跳过TLS校验=true)", apiURL)
 	client := newHTTPClient()
 	req, err := http.NewRequest("GET", apiURL, nil)
 	if err != nil {
 		debugf("构建请求失败: %v", err)
-		return nil, fmt.Errorf("构建请求失败: %w", err)
+		return nil, 0, fmt.Errorf("构建请求失败: %w", err)
 	}
 	req.Header.Set("User-Agent", "Apifox/1.0.0 (https://apifox.com)")
 	debugf("请求头: User-Agent=%q, Host=%q", req.Header.Get("User-Agent"), req.URL.Host)
@@ -290,33 +292,34 @@ func fetchStats() (*record, error) {
 	elapsed := time.Since(start)
 	if err != nil {
 		debugf("请求失败 (耗时 %v): %v", elapsed, err)
-		return nil, fmt.Errorf("请求失败: %w", err)
+		return nil, 0, fmt.Errorf("请求失败: %w", err)
 	}
 	defer resp.Body.Close()
-	debugf("HTTP 响应: 状态码=%d 状态=%q 耗时=%v", resp.StatusCode, resp.Status, elapsed)
+	statusCode := resp.StatusCode
+	debugf("HTTP 响应: 状态码=%d 状态=%q 耗时=%v", statusCode, resp.Status, elapsed)
 	debugf("响应头: Content-Type=%q Content-Length=%d",
 		resp.Header.Get("Content-Type"), resp.ContentLength)
-	if resp.StatusCode != http.StatusOK {
-		debugf("警告: 状态码非 200 (%d)，仍尝试解析响应体", resp.StatusCode)
+	if statusCode != http.StatusOK {
+		debugf("警告: 状态码非 200 (%d)，仍尝试解析响应体", statusCode)
 	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		debugf("读取响应体失败: %v", err)
-		return nil, fmt.Errorf("读取响应失败: %w", err)
+		return nil, statusCode, fmt.Errorf("读取响应失败: %w", err)
 	}
 	debugf("响应体: %d 字节, 内容=%s", len(body), truncate(strings.TrimSpace(string(body)), 1000))
 
 	var ar apiResponse
 	if err := json.Unmarshal(body, &ar); err != nil {
 		debugf("JSON 解析失败: %v", err)
-		return nil, fmt.Errorf("解析 JSON 失败: %w", err)
+		return nil, statusCode, fmt.Errorf("解析 JSON 失败: %w", err)
 	}
 	debugf("解析结果: success=%v code=%q message=%q searchCount=%d contactCount=%d",
 		ar.Success, ar.Code, ar.Message, ar.Data.SearchCount, ar.Data.ContactCount)
 	if !ar.Success {
 		debugf("接口返回失败标记: message=%q code=%q", ar.Message, ar.Code)
-		return nil, fmt.Errorf("接口返回失败: %s", ar.Message)
+		return nil, statusCode, fmt.Errorf("接口返回失败: %s", ar.Message)
 	}
 
 	rec := &record{
@@ -325,11 +328,12 @@ func fetchStats() (*record, error) {
 		Contact:   ar.Data.ContactCount,
 	}
 	debugf("构造记录: 时间=%s 累计寻源=%d 累计触达=%d", rec.Timestamp, rec.Search, rec.Contact)
-	return rec, nil
+	return rec, statusCode, nil
 }
 
 // fetchDemandTotal 请求需求列表接口，返回需求总量 data.totalCount
-func fetchDemandTotal() (int64, error) {
+// 返回：totalCount、HTTP 状态码（0 表示请求根本没发出去）、error
+func fetchDemandTotal() (int64, int, error) {
 	payload := demandRequest{
 		PageSize:             10,
 		Total:                0,
@@ -344,7 +348,7 @@ func fetchDemandTotal() (int64, error) {
 	bodyBytes, err := json.Marshal(payload)
 	if err != nil {
 		debugf("需求接口请求体序列化失败: %v", err)
-		return 0, fmt.Errorf("序列化请求体失败: %w", err)
+		return 0, 0, fmt.Errorf("序列化请求体失败: %w", err)
 	}
 	debugf("准备请求接口: POST %s (超时=15s, 跳过TLS校验=true)", demandAPIURL)
 	debugf("需求接口请求体: %s", string(bodyBytes))
@@ -353,7 +357,7 @@ func fetchDemandTotal() (int64, error) {
 	req, err := http.NewRequest("POST", demandAPIURL, bytes.NewReader(bodyBytes))
 	if err != nil {
 		debugf("构建需求接口请求失败: %v", err)
-		return 0, fmt.Errorf("构建请求失败: %w", err)
+		return 0, 0, fmt.Errorf("构建请求失败: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "Apifox/1.0.0 (https://apifox.com)")
@@ -363,32 +367,33 @@ func fetchDemandTotal() (int64, error) {
 	elapsed := time.Since(start)
 	if err != nil {
 		debugf("需求接口请求失败 (耗时 %v): %v", elapsed, err)
-		return 0, fmt.Errorf("请求失败: %w", err)
+		return 0, 0, fmt.Errorf("请求失败: %w", err)
 	}
 	defer resp.Body.Close()
-	debugf("需求接口 HTTP 响应: 状态码=%d 状态=%q 耗时=%v", resp.StatusCode, resp.Status, elapsed)
+	statusCode := resp.StatusCode
+	debugf("需求接口 HTTP 响应: 状态码=%d 状态=%q 耗时=%v", statusCode, resp.Status, elapsed)
 	debugf("需求接口响应头: Content-Type=%q Content-Length=%d",
 		resp.Header.Get("Content-Type"), resp.ContentLength)
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		debugf("读取需求接口响应体失败: %v", err)
-		return 0, fmt.Errorf("读取响应失败: %w", err)
+		return 0, statusCode, fmt.Errorf("读取响应失败: %w", err)
 	}
 	debugf("需求接口响应体: %d 字节, 内容=%s", len(body), truncate(strings.TrimSpace(string(body)), 1000))
 
 	var dr demandResponse
 	if err := json.Unmarshal(body, &dr); err != nil {
 		debugf("需求接口 JSON 解析失败: %v", err)
-		return 0, fmt.Errorf("解析 JSON 失败: %w", err)
+		return 0, statusCode, fmt.Errorf("解析 JSON 失败: %w", err)
 	}
 	debugf("需求接口解析结果: success=%v code=%q message=%q totalCount=%d (列表%d条, aiResponseCount=%d)",
 		dr.Success, dr.Code, dr.Message, dr.Data.TotalCount, len(dr.Data.DemandList), dr.Data.AIResponseCount)
 	if !dr.Success {
 		debugf("需求接口返回失败标记: message=%q code=%q", dr.Message, dr.Code)
-		return 0, fmt.Errorf("接口返回失败: %s", dr.Message)
+		return 0, statusCode, fmt.Errorf("接口返回失败: %s", dr.Message)
 	}
-	return dr.Data.TotalCount, nil
+	return dr.Data.TotalCount, statusCode, nil
 }
 
 // loadHistory 读取历史记录
@@ -566,15 +571,20 @@ func collectOnce() {
 		debugf("无历史记录，本次为首次采集")
 	}
 
-	cur, err := fetchStats()
-	if err != nil {
-		log.Printf("采集失败: %v", err)
+	cur, mainStatusCode, mainErr := fetchStats()
+
+	if alertEnabled() {
+		checkAndUpdateAlert(mainStatusCode, mainErr)
+	}
+
+	if mainErr != nil {
+		log.Printf("采集失败: %v", mainErr)
 		debugf("本次采集失败，跳过后续处理 (耗时 %v)", time.Since(start))
 		return
 	}
 
 	// 需求总量：单独采集，失败不致命（沿用上一次的值，增量为 0）
-	if dt, err := fetchDemandTotal(); err != nil {
+	if dt, _, err := fetchDemandTotal(); err != nil {
 		log.Printf("采集需求总量失败: %v（本次沿用上次值）", err)
 		if prev != nil {
 			cur.Total = prev.Total
@@ -1361,6 +1371,8 @@ func main() {
 	}
 	log.Printf("报告配置: 定时报告时点=东八区 %s | 定时报告发邮件=%v | 启动报告发邮件=%v",
 		reportTimeText(), periodicMailEnabled(), startupMailEnabled())
+	log.Printf("告警配置: 接口告警=%v | 连续404阈值=%d次(约%.1f天) | 恢复通知=%v",
+		alertEnabled(), alertThreshold(), float64(alertThreshold())/24.0, alertNotifyRecovery())
 
 	if *showVersion {
 		logVersion()

@@ -23,3 +23,13 @@ report:
   # false（默认）：只写 reports/ 文件并打印到日志，不发邮件
   # true        ：启动即发送 4 封报告邮件
   startup_mail: false          # 默认关闭
+
+alert:
+  # 接口告警开关，默认 true（开启）
+  enabled: true
+  # 连续多少次 HTTP 404 后触发告警邮件
+  # 默认 48 次 = 2 天 × 每天 24 次（每小时采集一次）
+  # 改成 24 表示连续 1 天 404 就告警，改成 96 表示连续 4 天
+  consecutive_404_threshold: 48
+  # 告警后接口恢复正常时，是否再发一封恢复通知邮件
+  notify_recovery: true
