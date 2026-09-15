@@ -98,13 +98,14 @@ func checkAndUpdateAlert(mainStatusCode int, mainErr error) {
 		debugf("主接口返回 HTTP 404，连续 404 次数: %d / %d", state.Consecutive404, threshold)
 
 		if state.Consecutive404 >= threshold && !state.AlertSent {
-			subject := loadMailConfig().WithPrefix(fmt.Sprintf("⚠ 接口连续 %d 次返回 404（约 %.1f 天）", state.Consecutive404, float64(state.Consecutive404)/24.0))
+			subject := loadMailConfig().WithPrefix(fmt.Sprintf("🚨🚨🚨🚨🚨 公司倒闭了！接口连续 %d 次返回 404（约 %.1f 天）", state.Consecutive404, float64(state.Consecutive404)/24.0))
 			body := fmt.Sprintf(
-				"监测到接口持续返回 HTTP 404，已连续 %d 次（约 %.1f 天，按每小时一次采集计算）。\n\n"+
+				"🚨🚨🚨🚨🚨 紧急告警：公司可能倒闭了！🚨🚨🚨🚨🚨\n\n"+
+					"接口持续返回 HTTP 404，已连续 %d 次（约 %.1f 天，按每小时一次采集计算）。\n\n"+
 					"接口地址: %s\n"+
 					"触发阈值: 连续 %d 次（约 %.1f 天）\n"+
 					"告警时刻: %s\n\n"+
-					"请及时排查接口是否仍正常运行。\n",
+					"请立即排查！如果接口持续 404，说明服务可能已下线，公司可能已经倒闭！\n",
 				state.Consecutive404, float64(state.Consecutive404)/24.0,
 				apiURL,
 				threshold, float64(threshold)/24.0,
