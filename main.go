@@ -788,6 +788,69 @@ func renderPeakAnalysis(deltas map[string][metricCount]int64, keys, shortLabels 
 	return b.String()
 }
 
+// heatmapChars 热力图使用的 5 级"亮度"字符（由浅到深），与图例 "Less ⠂ ⣀ ⣄ ⣶ ⣿ More" 一一对应。
+// 无数据/无增量的日子使用最浅的 ⠂，与图例首字符保持一致。
+var heatmapChars = [5]rune{'⠂', '⣀', '⣄', '⣶', '⣿'}
+
+// heatmapLevel 把"某天的增量"归一化成 0~4 的亮度等级：
+// 0 = 当天无增量（最浅），4 = 全年单日最大（最深）；其余按 value/max 线性映射，最低为 1。
+func heatmapLevel(value, max int64) int {
+	if value <= 0 || max <= 0 {
+		return 0
+	}
+	lv := int(float64(value)/float64(max)*4 + 0.5)
+	if lv < 1 {
+		lv = 1
+	}
+	if lv > 4 {
+		lv = 4
+	}
+	return lv
+}
+
+// renderYearHeatmap 渲染年报的"全年每日热力图"区块：
+//   - 每行一个月（01月 ~ 12月），每行固定 35 个字符 = 7 组 × 5 天，组间用 | 分隔，便于对照日历阅读
+//   - 每个字符代表当月的一天；超出当月天数、或当天无增量的位置，都显示最浅的 ⠂
+//   - 字符亮度由"当天增量 / 全年单日最大值"决定，只看相对高低，不影响其它区块的绝对数值
+func renderYearHeatmap(daily map[string][metricCount]int64, year, idx int) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "【全年每日热力图】(指标: %s, 单位: %s)\n", metricNames[idx], metricUnits[idx])
+	fmt.Fprintf(&b, "  %d年\n", year)
+
+	max := int64(0)
+	for _, v := range daily {
+		if v[idx] > max {
+			max = v[idx]
+		}
+	}
+	for m := 1; m <= 12; m++ {
+		daysInMonth := time.Date(year, time.Month(m)+1, 0, 0, 0, 0, 0, chinaLoc).Day()
+		var line strings.Builder
+		for g := 0; g < 7; g++ {
+			line.WriteByte('|')
+			for i := 0; i < 5; i++ {
+				d := g*5 + i + 1
+				if d > daysInMonth {
+					line.WriteRune(heatmapChars[0])
+					continue
+				}
+				key := fmt.Sprintf("%04d-%02d-%02d", year, m, d)
+				line.WriteRune(heatmapChars[heatmapLevel(daily[key][idx], max)])
+			}
+		}
+		line.WriteByte('|')
+		fmt.Fprintf(&b, "%02d月%s\n", m, line.String())
+	}
+
+	legend := make([]string, 0, len(heatmapChars))
+	for _, c := range heatmapChars {
+		legend = append(legend, string(c))
+	}
+	fmt.Fprintf(&b, "  Less %s More (按全年单日最大增量 %d %s 归一化)\n\n",
+		strings.Join(legend, " "), max, metricUnits[idx])
+	return b.String()
+}
+
 // dayBaselineAndEnd 定位某天的"起始基准"与"期末"两条记录：
 //   - 起始基准 = 该日 00:00 之前最后一条记录（正常情况下是前一日 23:00 的记录），
 //     因此"期末 - 基准"覆盖的正是该日 0:00 ~ 23:59 的全部增量；
@@ -1110,9 +1173,19 @@ func generateYearlyReport(hist []record, ref time.Time) (string, error) {
 		labels[i] = d.Format("2006-01")
 		shortLabels[i] = d.Format("2006-01")
 	}
-	// 汇总区块：全年合计/月均 + 哪个月是高峰/低峰
+	// 每日聚合：用于"全年每日热力图"区块（每行一个月、每个字符一天）
+	daily := aggByPeriod(hist, func(r record) bool {
+		return len(r.Timestamp) >= 10 && r.Timestamp[:4] == y
+	}, func(r record) string { return r.Timestamp[:10] })
+
+	// 汇总区块：全年合计/月均 + 哪个月是高峰/低峰 + 三个指标的全年每日热力图
+	heat := make([]string, 0, metricCount)
+	for idx := 0; idx < metricCount; idx++ {
+		heat = append(heat, renderYearHeatmap(daily, ref.Year(), idx))
+	}
 	summary := buildPeriodSummary(deltas, keys, "月均") +
-		renderPeakAnalysis(deltas, keys, shortLabels, "按月")
+		renderPeakAnalysis(deltas, keys, shortLabels, "按月") +
+		strings.Join(heat, "")
 	fileName := fmt.Sprintf("year_%s_report.txt", y)
 	content, err := renderReport("year", fmt.Sprintf("年活跃度报告  %s", y), fileName, deltas, keys, labels, summary)
 	if err != nil {
