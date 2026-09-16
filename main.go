@@ -1352,8 +1352,6 @@ func main() {
 	flag.Parse()
 	debugEnabled = *debugFlag
 
-	log.SetFlags(log.LstdFlags)
-
 	// 加载配置文件：相对路径基于工作目录；读取失败时回退到默认配置，不阻断运行
 	cfgPath := *configFile
 	if !filepath.IsAbs(cfgPath) {
