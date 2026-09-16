@@ -809,8 +809,8 @@ func heatmapLevel(value, max int64) int {
 }
 
 // renderYearHeatmap 渲染年报的"全年每日热力图"区块：
-//   - 每行一个月（01月 ~ 12月），每行固定 35 个字符 = 7 组 × 5 天，组间用 | 分隔，便于对照日历阅读
-//   - 每个字符代表当月的一天；超出当月天数、或当天无增量的位置，都显示最浅的 ⠂
+//   - 每行一个月（01月 ~ 12月），每组 |...| 代表一周（周一~周日），周数按当月实际跨度动态计算（4~6周）
+//   - 按当月第一天的星期几对齐；超出当月天数或属于上月/下周的位置，显示最浅的 ⠂
 //   - 字符亮度由"当天增量 / 全年单日最大值"决定，只看相对高低，不影响其它区块的绝对数值
 func renderYearHeatmap(daily map[string][metricCount]int64, year, idx int) string {
 	var b strings.Builder
@@ -825,12 +825,16 @@ func renderYearHeatmap(daily map[string][metricCount]int64, year, idx int) strin
 	}
 	for m := 1; m <= 12; m++ {
 		daysInMonth := time.Date(year, time.Month(m)+1, 0, 0, 0, 0, 0, chinaLoc).Day()
+		firstWeekday := int(time.Date(year, time.Month(m), 1, 0, 0, 0, 0, chinaLoc).Weekday())
+		startOffset := (firstWeekday + 6) % 7
+		needWeeks := (startOffset + daysInMonth + 6) / 7
+
 		var line strings.Builder
-		for g := 0; g < 7; g++ {
+		for g := 0; g < needWeeks; g++ {
 			line.WriteByte('|')
-			for i := 0; i < 5; i++ {
-				d := g*5 + i + 1
-				if d > daysInMonth {
+			for i := 0; i < 7; i++ {
+				d := g*7 + i - startOffset + 1
+				if d < 1 || d > daysInMonth {
 					line.WriteRune(heatmapChars[0])
 					continue
 				}
