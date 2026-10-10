@@ -17,10 +17,12 @@ type AlertState struct {
 
 var alertStateFile string
 
+// initAlertState 初始化告警状态文件的路径（基于工作目录）
 func initAlertState() {
 	alertStateFile = filepath.Join(workDir, "alert_state.json")
 }
 
+// loadAlertState 从磁盘读取告警状态，文件不存在或解析失败时返回空状态
 func loadAlertState() AlertState {
 	data, err := os.ReadFile(alertStateFile)
 	if err != nil {
@@ -37,6 +39,7 @@ func loadAlertState() AlertState {
 	return s
 }
 
+// saveAlertState 将告警状态序列化为 JSON 并持久化到磁盘
 func saveAlertState(s AlertState) {
 	data, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
@@ -50,6 +53,7 @@ func saveAlertState(s AlertState) {
 	debugf("告警状态已保存: consecutive_404=%d alert_sent=%v", s.Consecutive404, s.AlertSent)
 }
 
+// alertEnabled 返回告警开关的当前值：优先取配置，无配置时回退到默认值
 func alertEnabled() bool {
 	if appConfig != nil {
 		return appConfig.Alert.Enabled
@@ -57,6 +61,7 @@ func alertEnabled() bool {
 	return DefaultAlertConfig().Enabled
 }
 
+// alertThreshold 返回连续 404 告警阈值的当前值：优先取配置，无配置/为 0 时回退到默认值
 func alertThreshold() int {
 	if appConfig != nil && appConfig.Alert.Consecutive404Threshold > 0 {
 		return appConfig.Alert.Consecutive404Threshold
@@ -64,6 +69,7 @@ func alertThreshold() int {
 	return DefaultAlertConfig().Consecutive404Threshold
 }
 
+// alertNotifyRecovery 返回"告警后恢复通知"开关的当前值：优先取配置，无配置时回退到默认值
 func alertNotifyRecovery() bool {
 	if appConfig != nil {
 		return appConfig.Alert.NotifyRecovery
@@ -74,6 +80,9 @@ func alertNotifyRecovery() bool {
 const statusCodeNotFound = 404
 const statusCodeRequestFailed = 0
 
+// checkAndUpdateAlert 根据主接口的 HTTP 状态码判断是否需要触发/解除告警：
+//   - 连续 404 达到阈值时发送告警邮件
+//   - 从 404 恢复正常时（若已发过告警且配置了恢复通知）发送恢复邮件
 func checkAndUpdateAlert(mainStatusCode int, mainErr error) {
 	initAlertState()
 	state := loadAlertState()

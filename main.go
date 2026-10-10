@@ -180,6 +180,7 @@ func initDebug() {
 // 改由本 Writer 在每条记录前补一个东八区时间戳，使控制台与日志文件的时间口径完全一致。
 type cstLogWriter struct{ w io.Writer }
 
+// Write 实现 io.Writer 接口，在每条日志前补上东八区时间戳
 func (c cstLogWriter) Write(p []byte) (int, error) {
 	body := strings.TrimRight(string(p), "\r\n")
 	if body == "" {
@@ -212,6 +213,7 @@ func truncate(s string, max int) string {
 	return s[:max] + fmt.Sprintf("...(已截断, 共%d字节)", len(s))
 }
 
+// init 程序包初始化：设置时区、日志输出目标、工作目录及相关子目录
 func init() {
 	initDebug()
 	initChinaLoc()          // 必须先于任何时间处理，确保日志/采集/报告全部使用东八区
@@ -620,6 +622,7 @@ func collectOnce() {
 	debugf("本次采集总耗时: %v", time.Since(start))
 }
 
+// barChart 绘制一条水平柱状图（用 █ 和 ░ 字符），value 为当前值、max 为最大值、width 为总宽度
 func barChart(value, max int64, width int) string {
 	absV := value
 	if absV < 0 {
@@ -679,6 +682,7 @@ func aggByPeriod(hist []record, match func(record) bool, keyFunc func(record) st
 	return out
 }
 
+// renderBarSection 渲染一个指标（idx）的柱状图区块：标题、单位、每个桶的柱状图及数值
 func renderBarSection(w *bufio.Writer, title, unit string, deltas map[string][metricCount]int64, keys, labels []string, idx int) {
 	fmt.Fprintf(w, "【%s】(%s)\n", title, unit)
 	max := int64(0)
@@ -809,8 +813,10 @@ func heatmapLevel(value, max int64) int {
 }
 
 // renderYearHeatmap 渲染年报的"全年每日热力图"区块：
-//   - 每行一个月（01月 ~ 12月），每组 |...| 代表一周（周一~周日），固定 5 周共 35 个点
-//   - 按当月第一天的星期几对齐；超出当月天数或属于上月/下周的位置，显示最浅的 ⠂
+//   - 每行一个月（01月 ~ 12月），每组 |...| 固定 7 个点，共 5 组 35 个点
+//   - 每组内的位置严格按"日号"顺序排列：第 1 组是 1~7 号，第 2 组是 8~14 号，依此类推；
+//     即每月都从 1 号开始排，不按星期几对齐，同一列不代表同一个星期几
+//   - 超出当月天数（如 2 月的 29~35 号）的位置显示最浅的 ⠂
 //   - 字符亮度由"当天增量 / 全年单日最大值"决定，只看相对高低，不影响其它区块的绝对数值
 func renderYearHeatmap(daily map[string][metricCount]int64, year, idx int) string {
 	var b strings.Builder
@@ -824,17 +830,16 @@ func renderYearHeatmap(daily map[string][metricCount]int64, year, idx int) strin
 		}
 	}
 	const fixedWeeks = 5
+	const daysPerWeek = 7
 	for m := 1; m <= 12; m++ {
 		daysInMonth := time.Date(year, time.Month(m)+1, 0, 0, 0, 0, 0, chinaLoc).Day()
-		firstWeekday := int(time.Date(year, time.Month(m), 1, 0, 0, 0, 0, chinaLoc).Weekday())
-		startOffset := (firstWeekday + 6) % 7
 
 		var line strings.Builder
 		for g := 0; g < fixedWeeks; g++ {
 			line.WriteByte('|')
-			for i := 0; i < 7; i++ {
-				d := g*7 + i - startOffset + 1
-				if d < 1 || d > daysInMonth {
+			for i := 0; i < daysPerWeek; i++ {
+				d := g*daysPerWeek + i + 1
+				if d > daysInMonth {
 					line.WriteRune(heatmapChars[0])
 					continue
 				}
@@ -850,8 +855,9 @@ func renderYearHeatmap(daily map[string][metricCount]int64, year, idx int) strin
 	for _, c := range heatmapChars {
 		legend = append(legend, string(c))
 	}
-	fmt.Fprintf(&b, "  Less %s More (按全年单日最大增量 %d %s 归一化)\n\n",
+	fmt.Fprintf(&b, "  Less %s More (按全年单日最大增量 %d %s 归一化)\n",
 		strings.Join(legend, " "), max, metricUnits[idx])
+	fmt.Fprintf(&b, "  说明: 每行一个月, 每格一天, 每组 7 天(1~7 号 / 8~14 号 / ...), 每月均从 1 号开始\n\n")
 	return b.String()
 }
 
@@ -1415,6 +1421,12 @@ func runHourly() {
 	}
 }
 
+// main 程序入口：解析命令行参数、加载配置，根据模式选择执行路径：
+//   - -once: 单次采集后退出
+//   - -report/-week/-month/-year: 手动生成指定报告
+//   - -mail: 发送测试邮件
+//   - -version: 打印版本号
+//   - 默认: 常驻运行（每小时整点采集 + 每天定时出报告）
 func main() {
 	once := flag.Bool("once", false, "只采集一次后退出（用于测试或配合外部计划任务）")
 	reportDay := flag.String("report", "", "手动生成指定日期(YYYY-MM-DD)的日报，基于本地历史数据")
