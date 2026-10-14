@@ -712,6 +712,18 @@ func renderBarSection(w *bufio.Writer, title, unit string, deltas map[string][me
 	fmt.Fprintf(w, "\n")
 }
 
+// renderBarSectionsToString 把三个指标的柱状图区块渲染成字符串，
+// 供需要在汇总区块中嵌入完整柱状图的场景复用（如年报的"按周统计"）
+func renderBarSectionsToString(deltas map[string][metricCount]int64, keys, labels []string) string {
+	var b strings.Builder
+	w := bufio.NewWriter(&b)
+	renderBarSection(w, "累计寻源次数", "次", deltas, keys, labels, 0)
+	renderBarSection(w, "累计触达次数", "次", deltas, keys, labels, 1)
+	renderBarSection(w, "需求总量(totalCount)", "条", deltas, keys, labels, 2)
+	w.Flush()
+	return b.String()
+}
+
 // metricNames / metricUnits 分析区块中三个指标的名称与单位（顺序与 metricCount 对应）
 var metricNames = [metricCount]string{"累计寻源次数", "累计触达次数", "需求总量"}
 
@@ -1101,9 +1113,14 @@ func generateDailyReport(hist []record, targetDay string) (string, error) {
 	return content, nil
 }
 
+// weekMonday 返回 d 所在周（周一~周日）的周一日期
+func weekMonday(d time.Time) time.Time {
+	return d.AddDate(0, 0, -int((int(d.Weekday())+6)%7))
+}
+
 // generateWeeklyReport 生成 ref 所在周的周报（周一~周日，按天）
 func generateWeeklyReport(hist []record, ref time.Time) (string, error) {
-	monday := ref.AddDate(0, 0, -int((int(ref.Weekday())+6)%7))
+	monday := weekMonday(ref)
 	sunday := monday.AddDate(0, 0, 6)
 	startStr := monday.Format("2006-01-02")
 	endStr := sunday.Format("2006-01-02")
@@ -1166,7 +1183,47 @@ func generateMonthlyReport(hist []record, ref time.Time) (string, error) {
 	return content, nil
 }
 
-// generateYearlyReport 生成 ref 所在年份的年报（按月）
+// buildWeeklyYearSection 生成年报的"按周统计"区块：全年按"周一~周日"分周聚合增量，
+// 输出本周期合计/周均汇总、按周高峰/低峰分析，以及三个指标的周柱状图。
+// 周从"1 月 1 日所在周的周一"起逐周编号 W01/W02/...；跨年周
+// （如含 1 月 1 日那一周的周一落在上一年 12 月，或最后一周的周日落到下一年 1 月）
+// 只统计落在本年内的天数。
+func buildWeeklyYearSection(hist []record, year int) string {
+	yearStr := fmt.Sprintf("%04d", year)
+	weekly := aggByPeriod(hist, func(r record) bool {
+		return len(r.Timestamp) >= 4 && r.Timestamp[:4] == yearStr
+	}, func(r record) string {
+		d, err := parseInCST("2006-01-02", r.Timestamp[:10])
+		if err != nil {
+			return r.Timestamp[:10]
+		}
+		return weekMonday(d).Format("2006-01-02")
+	})
+
+	jan1 := time.Date(year, time.January, 1, 0, 0, 0, 0, chinaLoc)
+	dec31 := time.Date(year, time.December, 31, 0, 0, 0, 0, chinaLoc)
+	keys := make([]string, 0, 53)
+	labels := make([]string, 0, 53)
+	shortLabels := make([]string, 0, 53) // 分析区块用的简短标签：W01
+	for m := weekMonday(jan1); !m.After(dec31); m = m.AddDate(0, 0, 7) {
+		sun := m.AddDate(0, 0, 6)
+		keys = append(keys, m.Format("2006-01-02"))
+		labels = append(labels, fmt.Sprintf("W%02d %s~%s", len(keys), m.Format("01-02"), sun.Format("01-02")))
+		shortLabels = append(shortLabels, fmt.Sprintf("W%02d", len(keys)))
+	}
+	if len(keys) == 0 {
+		return ""
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "【按周统计】(周一~周日, 共 %d 周)\n", len(keys))
+	fmt.Fprint(&b, buildPeriodSummary(weekly, keys, "周均"))
+	fmt.Fprint(&b, renderPeakAnalysis(weekly, keys, shortLabels, "按周"))
+	fmt.Fprint(&b, renderBarSectionsToString(weekly, keys, labels))
+	return b.String()
+}
+
+// generateYearlyReport 生成 ref 所在年份的年报（按月 + 按周）
 func generateYearlyReport(hist []record, ref time.Time) (string, error) {
 	y := ref.Format("2006")
 	debugf("生成年报: 目标年份=%s (参考日=%s)", y, ref.Format("2006-01-02"))
@@ -1188,13 +1245,14 @@ func generateYearlyReport(hist []record, ref time.Time) (string, error) {
 		return len(r.Timestamp) >= 10 && r.Timestamp[:4] == y
 	}, func(r record) string { return r.Timestamp[:10] })
 
-	// 汇总区块：全年合计/月均 + 哪个月是高峰/低峰 + 三个指标的全年每日热力图
+	// 汇总区块：全年合计/月均 + 哪个月是高峰/低峰 + 按周统计 + 三个指标的全年每日热力图
 	heat := make([]string, 0, metricCount)
 	for idx := 0; idx < metricCount; idx++ {
 		heat = append(heat, renderYearHeatmap(daily, ref.Year(), idx))
 	}
 	summary := buildPeriodSummary(deltas, keys, "月均") +
 		renderPeakAnalysis(deltas, keys, shortLabels, "按月") +
+		buildWeeklyYearSection(hist, ref.Year()) +
 		strings.Join(heat, "")
 	fileName := fmt.Sprintf("year_%s_report.txt", y)
 	content, err := renderReport("year", fmt.Sprintf("年活跃度报告  %s", y), fileName, deltas, keys, labels, summary)
